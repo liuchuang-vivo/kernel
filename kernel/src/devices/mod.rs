@@ -33,6 +33,8 @@ pub mod bus;
 pub mod clock;
 pub mod console;
 mod error;
+#[cfg(soc_esp32c6)]
+pub mod gdma_test;
 pub mod framebuffer;
 pub mod gpio;
 pub mod i2c_core;
@@ -370,6 +372,11 @@ impl NativeDevice {
 pub fn init() -> Result<(), Error> {
     null::Null::register().map_err(Error::from)?;
     zero::Zero::register().map_err(Error::from)?;
+    // Tier 3: /dev/gdma_test M2M self-test device (ESP32-C6 GDMA only).
+    #[cfg(soc_esp32c6)]
+    gdma_test::GdmaTestDevice::new()
+        .register()
+        .map_err(Error::from)?;
     Ok(())
 }
 

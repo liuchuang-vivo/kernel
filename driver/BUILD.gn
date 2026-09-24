@@ -24,6 +24,7 @@ build_rust("blueos_driver") {
            "//external/vendor/spin-0.9.8:spin",
            "//external/vendor/tock-registers-0.10.1:tock_registers",
            "//external/vendor/zerocopy-0.8.27:zerocopy",
+           "//kernel/arch:arch_crate",
            "//kernel/hal:blueos_hal",
            "//kernel/kconfig:generate_rustflags_file",
          ] + board_deps

@@ -104,6 +104,16 @@ extern "C" fn init() {
         Err(err) => panic!("Failed to init console: {}", crate::error::Error::from(err)),
     }
 
+    // Register the GDMA M2M self-test character device (/dev/gdma_test) so
+    // userspace can trigger a DMA copy-and-verify via ioctl(CMD_M2M_TEST).
+    // ESP32-C6 only — the driver is gated on `soc_esp32c6`.
+    #[cfg(soc_esp32c6)]
+    {
+        crate::devices::gdma_test::GdmaTestDevice::new()
+            .register()
+            .expect("failed to register /dev/gdma_test");
+    }
+
     #[cfg(virtio)]
     {
         use crate::devices::virtio;

@@ -17,6 +17,7 @@ use crate::{
     arch::riscv::{local_irq_enabled, trap_entry, Context},
     kearly_println,
 };
+use blueos_driver::dma::esp32c6_gdma::{DmaChanIsr, Esp32c6GdmaChannel};
 use blueos_driver::uart::esp32_usb_serial::Esp32UsbSerialIsr;
 use blueos_hal::{isr::IsrDesc, Has8bitDataReg};
 
@@ -106,6 +107,14 @@ const INTMTX_BASE: usize = 0x6001_0000;
 const INTMTX_USB_SERIAL_JTAG_MAP: usize = INTMTX_BASE + 0xC0;
 
 const INTMTX_SYSTIMER_TARGET0_MAP: usize = INTMTX_BASE + 0xE4;
+
+// GDMA OUT_CH0 maps to INTMTX source 74 (see ESP32-C6 TRM interrupt matrix).
+// core_0_intr_map[74] sits at INTMTX_BASE + 74*4 = +0x128. The board already
+// uses CPU lines 0/1 (WiFi), 15 (USB-Serial-JTAG), 16 (systimer target0);
+// line 17 is free and is assigned to GDMA OUT0 here. Routed exactly like
+// the USB-Serial-JTAG and systimer sources above.
+const INTMTX_DMA_OUT0_MAP: usize = INTMTX_BASE + 0x128;
+const GDMA_OUT0_INT_NUM: usize = 17;
 
 const TARGET0_INT_NUM: usize = 16;
 
@@ -546,6 +555,12 @@ pub(crate) fn handle_intc_irq(ctx: &Context, mcause: usize, mtval: usize) {
         USB_SERIAL_JTAG_INT_NUM => {
             ESP32_USB_SERIAL_ISR.service_isr();
         }
+        // GDMA OUT0 completion (source 74 routed to line 17 above). Plain
+        // static ISR, dispatched directly — no #[interrupt] macro (RISC-V
+        // has no .isr.reg section scan; same pattern as USB-Serial-JTAG).
+        GDMA_OUT0_INT_NUM => {
+            GDMA_OUT0_ISR.service_isr();
+        }
         _ => {}
     }
 }
@@ -580,6 +595,10 @@ pub(crate) fn init() {
         write32(PLIC_MX_THRESH, 1);
         route_source(INTMTX_USB_SERIAL_JTAG_MAP, USB_SERIAL_JTAG_INT_NUM, 15);
         route_source(INTMTX_SYSTIMER_TARGET0_MAP, TARGET0_INT_NUM, 15);
+        // GDMA OUT0 completion interrupt: source 74 → CPU line 17. The ISR
+        // (GDMA_OUT0_ISR below) is a plain static dispatched from
+        // handle_intc_irq, mirroring the USB-Serial-JTAG pattern.
+        route_source(INTMTX_DMA_OUT0_MAP, GDMA_OUT0_INT_NUM, 15);
     }
 
     // unsafe {
@@ -778,6 +797,10 @@ pub(crate) fn init() {
 crate::define_peripheral! {
     (console_uart, blueos_driver::uart::esp32_usb_serial::Esp32UsbSerial<0x6000_F000>,
      blueos_driver::uart::esp32_usb_serial::Esp32UsbSerial::<0x6000_F000>::new()),
+    // GDMA channel 0 (TX/out path). ZST singleton; indexed by CH=0. The
+    // completion ISR (GDMA_OUT0_ISR) holds a &'static reference to this.
+    (dma0_tx, blueos_driver::dma::esp32c6_gdma::Esp32c6GdmaChannel<0>,
+     blueos_driver::dma::esp32c6_gdma::Esp32c6GdmaChannel::<0>::new()),
 }
 
 crate::define_pin_states!(None);
@@ -794,3 +817,10 @@ static ESP32_USB_SERIAL_ISR: Esp32UsbSerialIsr<0x6000_F000, crate::drivers::seri
         tx_isr: Some(crate::drivers::serial::Serial::xmitchars),
         rx_isr: Some(crate::drivers::serial::Serial::recvchars),
     };
+
+// GDMA OUT0 completion ISR. Plain static (no #[interrupt]) dispatched from
+// handle_intc_irq's GDMA_OUT0_INT_NUM branch — same pattern as
+// ESP32_USB_SERIAL_ISR. Holds a &'static ref to the DMA0_TX singleton.
+static GDMA_OUT0_ISR: DmaChanIsr<Esp32c6GdmaChannel<0>> = DmaChanIsr {
+    chan: &DMA0_TX,
+};

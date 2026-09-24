@@ -1,4 +1,4 @@
-// Copyright (c) 2025 vivo Mobile Communication Co., Ltd.
+// Copyright (c) 2026 vivo Mobile Communication Co., Ltd.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,20 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![no_std]
-#![feature(const_nonnull_new)]
+//! DMA controller drivers.
+//!
+//! SoC-specific implementations are selected by `#[cfg(soc_*)]` at the
+//! module boundary, mirroring the `i2c` / `spi` / `uart` siblings.
 
-pub mod clock_control;
-pub mod dma;
-pub mod gpio;
-pub mod hwinfo;
-pub mod i2c;
-pub mod interrupt_controller;
-pub mod pinctrl;
-pub mod power;
-pub mod reset;
-pub mod rng;
-pub mod spi;
-pub mod static_ref;
-pub mod systimer;
-pub mod uart;
+#[cfg(soc_esp32c6)]
+pub mod esp32c6_gdma;
