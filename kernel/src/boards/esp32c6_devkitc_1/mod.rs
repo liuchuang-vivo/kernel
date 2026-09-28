@@ -788,6 +788,15 @@ pub(crate) fn send_ipi(_hart: usize) {}
 #[inline(always)]
 pub(crate) fn clear_ipi(_hart: usize) {}
 
+/// SPI bus initialization for esp32c6_devkitc_1.
+///
+/// Currently a no-op: this board declares no SPI peripherals and the CO5300
+/// display driver is not yet wired into the kernel. Exists to satisfy the
+/// `#[cfg(spi_core)]` call site in `boot::init` when an app enables
+/// `CONFIG_SPI_CORE=y` (e.g. the framebuffer example).
+#[cfg(spi_core)]
+pub(crate) fn init_spi_bus() {}
+
 static ESP32_USB_SERIAL_ISR: Esp32UsbSerialIsr<0x6000_F000, crate::drivers::serial::Serial> =
     Esp32UsbSerialIsr::<0x6000_F000, _> {
         data: &crate::drivers::serial::TTY_SERIAL,
