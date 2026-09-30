@@ -108,13 +108,30 @@ const INTMTX_USB_SERIAL_JTAG_MAP: usize = INTMTX_BASE + 0xC0;
 
 const INTMTX_SYSTIMER_TARGET0_MAP: usize = INTMTX_BASE + 0xE4;
 
-// GDMA OUT_CH0 maps to INTMTX source 74 (see ESP32-C6 TRM interrupt matrix).
-// core_0_intr_map[74] sits at INTMTX_BASE + 74*4 = +0x128. The board already
-// uses CPU lines 0/1 (WiFi), 15 (USB-Serial-JTAG), 16 (systimer target0);
-// line 17 is free and is assigned to GDMA OUT0 here. Routed exactly like
-// the USB-Serial-JTAG and systimer sources above.
-const INTMTX_DMA_OUT0_MAP: usize = INTMTX_BASE + 0x128;
+// GDMA OUT_CH0 maps to INTMTX source 69 (DMA_OUT_CH0, PAC
+// `esp32c6-0.23.0/src/interrupt.rs:145`). The interrupt matrix is
+// `core_0_intr_map[77]` at INTMTX_BASE (PAC `interrupt_core0.rs`), indexed by
+// source number, 4 bytes per slot — confirmed by the two working wirings
+// above: USB_DEVICE=48 → +0xC0, SYSTIMER_TARGET0=57 → +0xE4. So source 69
+// sits at INTMTX_BASE + 69*4 = +0x114. The board already uses CPU lines 0/1
+// (WiFi), 15 (USB-Serial-JTAG), 16 (systimer target0); line 17 is free and is
+// assigned to GDMA OUT0 here. Routed exactly like the USB-Serial-JTAG and
+// systimer sources above.
+//
+// NOTE: this was previously `+0x128` (= source 74 = SHA) — a misroute that
+// silently broke the OUT0 interrupt path. Fixed to `+0x114` so OUT0 actually
+// fires on DMA_OUT_CH0 completion.
+const INTMTX_DMA_OUT0_MAP: usize = INTMTX_BASE + 0x114;
 const GDMA_OUT0_INT_NUM: usize = 17;
+
+// GDMA IN_CH0 (RX completion) — source 66 (DMA_IN_CH0, PAC
+// `interrupt.rs:139`) → core_0_intr_map[66] @ INTMTX_BASE + 66*4 = +0x108.
+// CPU line 18 is free (OUT0 took 17); assigned to IN0 here. The M2M bridge
+// surfaces completion on the RX side as IN_SUC_EOF (HAL `hal/dma.rs` M2M
+// docstring; driver `m2m_transfer_impl`), so IN0 is the interrupt path the
+// M2M IRQ test waits on. Routed like OUT0 above.
+const INTMTX_DMA_IN0_MAP: usize = INTMTX_BASE + 0x108;
+const GDMA_IN0_INT_NUM: usize = 18;
 
 const TARGET0_INT_NUM: usize = 16;
 
@@ -555,11 +572,18 @@ pub(crate) fn handle_intc_irq(ctx: &Context, mcause: usize, mtval: usize) {
         USB_SERIAL_JTAG_INT_NUM => {
             ESP32_USB_SERIAL_ISR.service_isr();
         }
-        // GDMA OUT0 completion (source 74 routed to line 17 above). Plain
-        // static ISR, dispatched directly — no #[interrupt] macro (RISC-V
-        // has no .isr.reg section scan; same pattern as USB-Serial-JTAG).
+        // GDMA OUT0 completion (source 69 = DMA_OUT_CH0, routed to line 17
+        // above). Plain static ISR, dispatched directly — no #[interrupt]
+        // macro (RISC-V has no .isr.reg section scan; same pattern as
+        // USB-Serial-JTAG).
         GDMA_OUT0_INT_NUM => {
             GDMA_OUT0_ISR.service_isr();
+        }
+        // GDMA IN0 completion (source 66 = DMA_IN_CH0, routed to line 18).
+        // Same dispatch pattern; the RX-side IN_SUC_EOF block in
+        // `service_interrupt` fires the registered callback.
+        GDMA_IN0_INT_NUM => {
+            GDMA_IN0_ISR.service_isr();
         }
         _ => {}
     }
@@ -595,10 +619,14 @@ pub(crate) fn init() {
         write32(PLIC_MX_THRESH, 1);
         route_source(INTMTX_USB_SERIAL_JTAG_MAP, USB_SERIAL_JTAG_INT_NUM, 15);
         route_source(INTMTX_SYSTIMER_TARGET0_MAP, TARGET0_INT_NUM, 15);
-        // GDMA OUT0 completion interrupt: source 74 → CPU line 17. The ISR
-        // (GDMA_OUT0_ISR below) is a plain static dispatched from
+        // GDMA OUT0 completion interrupt: source 69 (DMA_OUT_CH0) → CPU line
+        // 17. The ISR (GDMA_OUT0_ISR below) is a plain static dispatched from
         // handle_intc_irq, mirroring the USB-Serial-JTAG pattern.
         route_source(INTMTX_DMA_OUT0_MAP, GDMA_OUT0_INT_NUM, 15);
+        // GDMA IN0 completion interrupt: source 66 (DMA_IN_CH0) → CPU line 18.
+        // Same dispatch pattern as OUT0. IN0 surfaces the M2M bridge's
+        // IN_SUC_EOF completion (the RX-side EOF the poll test waits on).
+        route_source(INTMTX_DMA_IN0_MAP, GDMA_IN0_INT_NUM, 15);
     }
 
     // unsafe {
@@ -801,6 +829,14 @@ crate::define_peripheral! {
     // completion ISR (GDMA_OUT0_ISR) holds a &'static reference to this.
     (dma0_tx, blueos_driver::dma::esp32c6_gdma::Esp32c6GdmaChannel<0>,
      blueos_driver::dma::esp32c6_gdma::Esp32c6GdmaChannel::<0>::new()),
+    // GDMA channel 0 (RX/in path) — same ZST type, same CH=0. IN0 and OUT0
+    // share channel 0 (the M2M bridge is per-channel); the RX-side interrupt
+    // is the IN_INT_CH[0] register set. This singleton exists only to give
+    // GDMA_IN0_ISR a &'static Esp32c6GdmaChannel<0> to dispatch — the
+    // channel's `service_interrupt` reads per-CH raw status, so the OUT0
+    // and IN0 ISRs each only see their own side's bits.
+    (dma0_rx, blueos_driver::dma::esp32c6_gdma::Esp32c6GdmaChannel<0>,
+     blueos_driver::dma::esp32c6_gdma::Esp32c6GdmaChannel::<0>::new()),
 }
 
 crate::define_pin_states!(None);
@@ -823,4 +859,12 @@ static ESP32_USB_SERIAL_ISR: Esp32UsbSerialIsr<0x6000_F000, crate::drivers::seri
 // ESP32_USB_SERIAL_ISR. Holds a &'static ref to the DMA0_TX singleton.
 static GDMA_OUT0_ISR: DmaChanIsr<Esp32c6GdmaChannel<0>> = DmaChanIsr {
     chan: &DMA0_TX,
+};
+
+// GDMA IN0 completion ISR. Same plain-static pattern as GDMA_OUT0_ISR,
+// dispatched from handle_intc_irq's GDMA_IN0_INT_NUM branch. Holds a
+// &'static ref to the DMA0_RX singleton (same CH=0). The RX-side
+// IN_SUC_EOF block in `service_interrupt` fires the registered callback.
+static GDMA_IN0_ISR: DmaChanIsr<Esp32c6GdmaChannel<0>> = DmaChanIsr {
+    chan: &DMA0_RX,
 };

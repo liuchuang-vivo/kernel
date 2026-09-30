@@ -373,6 +373,9 @@ pub fn init() -> Result<(), Error> {
     null::Null::register().map_err(Error::from)?;
     zero::Zero::register().map_err(Error::from)?;
     // Tier 3: /dev/gdma_test M2M self-test device (ESP32-C6 GDMA only).
+    // Registered in `boot.rs` for the normal esp32c6 build (the `gdma_test`
+    // app's interrupt test needs it). Kept here too for the `devices::init`
+    // path, with the same cfg, so the two sites stay consistent.
     #[cfg(soc_esp32c6)]
     gdma_test::GdmaTestDevice::new()
         .register()

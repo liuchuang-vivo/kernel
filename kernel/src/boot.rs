@@ -105,8 +105,12 @@ extern "C" fn init() {
     }
 
     // Register the GDMA M2M self-test character device (/dev/gdma_test) so
-    // userspace can trigger a DMA copy-and-verify via ioctl(CMD_M2M_TEST).
-    // ESP32-C6 only — the driver is gated on `soc_esp32c6`.
+    // userspace can trigger a DMA copy-and-verify via ioctl(CMD_M2M_TEST) and
+    // the interrupt-mode verification via ioctl(CMD_M2M_IRQ_TEST).
+    // ESP32-C6 only: the device is a manual ioctl trampoline specific to the
+    // GDMA controller. It now ships in the normal (non-test) esp32c6 build
+    // because the `gdma_test` app's interrupt test requires it at boot —
+    // without registration here, `open("/dev/gdma_test")` returns ENOENT.
     #[cfg(soc_esp32c6)]
     {
         crate::devices::gdma_test::GdmaTestDevice::new()
