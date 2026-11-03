@@ -21,6 +21,7 @@ pub mod block;
 pub mod buddy;
 pub mod llff;
 pub mod llff_hole;
+pub mod page_heap;
 pub mod slab;
 pub mod support;
 pub mod tlsf;
