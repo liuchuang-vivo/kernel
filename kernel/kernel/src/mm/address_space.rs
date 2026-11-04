@@ -14,8 +14,14 @@
 
 extern crate alloc;
 
-use crate::{error, mm::MemFlags, sync::SpinLock};
+use crate::{
+    error,
+    mm::{paging::PageFormat, MemFlags},
+    sync::SpinLock,
+};
 use alloc::collections::BTreeMap;
+
+pub const MMAP_MIN_DEFAULT: usize = <crate::arch::page::PageEntry as PageFormat>::PAGE_SIZE;
 
 /// A contiguous virtual-address range `[start, end)`
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,12 +94,14 @@ impl Vma {
 /// A process's independent virtual address space.
 pub struct AddressSpace {
     vmas: SpinLock<BTreeMap<usize, Vma>>,
+    mmap_min: usize,
 }
 
 impl AddressSpace {
     pub fn new() -> Self {
         Self {
             vmas: SpinLock::new(BTreeMap::new()),
+            mmap_min: MMAP_MIN_DEFAULT,
         }
     }
 
