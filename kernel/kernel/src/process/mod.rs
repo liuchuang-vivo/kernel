@@ -264,7 +264,7 @@ impl Process {
                 state: ProcessState::Alive,
             }),
             threads: SpinLock::new(ThreadList::new()),
-            address_space: Arc::new(AddressSpace::new()),
+            address_space: Arc::new(AddressSpace::new()?),
 
             #[cfg(enable_vfs)]
             fd_manager: SpinLock::new(FdManager::new()),
@@ -469,6 +469,11 @@ mod tests {
         assert!(root.address_space().is_empty());
         assert!(child.address_space().is_empty());
         assert!(!Arc::ptr_eq(root.address_space(), child.address_space()));
+        #[cfg(paging)]
+        assert_ne!(
+            root.address_space().root_address(),
+            child.address_space().root_address(),
+        );
 
         // When VFS is enabled, every process also owns an independent
         // per-process open-file table. The syscall path resolves each
