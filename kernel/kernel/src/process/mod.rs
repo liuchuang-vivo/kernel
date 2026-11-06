@@ -147,7 +147,6 @@ impl ProcessManager {
         if p.pid() != ROOT_PID {
             reparent_orphans_to_root(&self.root, p);
         }
-        // TODO: release AddressSpace resource
         p.become_dead();
         removed
     }
