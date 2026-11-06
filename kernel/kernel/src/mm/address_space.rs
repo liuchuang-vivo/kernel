@@ -15,10 +15,21 @@
 extern crate alloc;
 
 #[cfg(paging)]
+mod user_stack;
+#[cfg(paging)]
+pub use user_stack::UserStackLayout;
+#[cfg(paging)]
+mod stack_startup;
+#[cfg(paging)]
+pub use stack_startup::UserStackStart;
+
+#[cfg(paging)]
 use crate::{
     arch::page::PageEntry,
     mm::{
-        paging::{first_fit::FirstFitFrameAllocator, mapper::PageMapper, PageFormat},
+        paging::{
+            first_fit::FirstFitFrameAllocator, mapper::PageMapper, FrameAllocator, PageFormat,
+        },
         PhysicalAddress,
     },
 };
@@ -99,17 +110,40 @@ impl Vma {
     }
 }
 
+#[cfg(paging)]
+#[must_use = "dropping the state releases its inactive mappings and tables"]
+struct AddressSpaceState<F: FrameAllocator> {
+    vmas: BTreeMap<usize, Vma>,
+    mapper: PageMapper<F>,
+    user_stack: Option<UserStackLayout>,
+}
+
+#[cfg(not(paging))]
+struct AddressSpaceState {
+    vmas: BTreeMap<usize, Vma>,
+}
+
+#[cfg(not(paging))]
+impl AddressSpaceState {
+    fn manages_vma(&self, _start: usize) -> bool {
+        false
+    }
+}
+
+#[cfg(paging)]
+type State = AddressSpaceState<&'static FirstFitFrameAllocator>;
+#[cfg(not(paging))]
+type State = AddressSpaceState;
+
 /// A process's independent virtual address space.
 ///
-/// On paging systems, construction owns an empty, inactive user page table.
-/// Dropping the space releases its page-table frames. Hardware activation and
-/// mapped data-page ownership must be integrated before installing this root.
-#[must_use = "dropping an address space releases its inactive page tables"]
+/// Paging spaces own inactive page tables and any initialized user-stack backing.
+/// Destruction releases backing before the tables. Hardware activation and TLB
+/// lifetime management must be integrated before installing the root on a CPU.
+#[must_use = "dropping an address space releases its inactive mappings and tables"]
 pub struct AddressSpace {
-    vmas: SpinLock<BTreeMap<usize, Vma>>,
+    state: SpinLock<State>,
     mmap_min: usize,
-    #[cfg(paging)]
-    mapper: SpinLock<PageMapper<&'static FirstFitFrameAllocator>>,
 }
 
 impl AddressSpace {
@@ -126,7 +160,9 @@ impl AddressSpace {
         #[cfg(not(paging))]
         {
             Ok(Self {
-                vmas: SpinLock::new(BTreeMap::new()),
+                state: SpinLock::new(AddressSpaceState {
+                    vmas: BTreeMap::new(),
+                }),
                 mmap_min: MMAP_MIN_DEFAULT,
             })
         }
@@ -136,21 +172,79 @@ impl AddressSpace {
     fn new_with_allocator(
         allocator: &'static FirstFitFrameAllocator,
     ) -> Result<Self, error::Error> {
-        // SAFETY: the boot allocator owns disjoint frames writable through the
-        // kernel direct map. The configured PageEntry matches the hardware.
-        // This mapper remains inactive and owns its tables until drop.
-        let mapper = unsafe { PageMapper::create(allocator) }.map_err(|_| error::code::ENOMEM)?;
         Ok(Self {
-            vmas: SpinLock::new(BTreeMap::new()),
+            state: SpinLock::new(AddressSpaceState::new(allocator)?),
             mmap_min: MMAP_MIN_DEFAULT,
-            mapper: SpinLock::new(mapper),
         })
     }
 
     /// Physical root of this space's inactive user page table.
     #[cfg(paging)]
     pub fn root_address(&self) -> PhysicalAddress {
-        self.mapper.irqsave_lock().root_address()
+        self.state.irqsave_lock().mapper.root_address()
+    }
+
+    /// Allocate a fixed-size initial user stack at the user address limit.
+    ///
+    /// The usable size must be a nonzero page multiple. One additional lower
+    /// guard page is reserved but remains unmapped. Stack pages are zeroed,
+    /// user-readable/writable and non-executable. The table must remain inactive;
+    /// this does not set a CPU stack pointer or write a process startup frame.
+    ///
+    /// # Errors
+    /// - [`error::code::EINVAL`] — invalid size or insufficient address range.
+    /// - [`error::code::EEXIST`] — a stack exists or either reservation overlaps.
+    /// - [`error::code::ENOMEM`] — backing or page-table frame allocation failed.
+    #[cfg(paging)]
+    pub fn init_user_stack(&self, size: usize) -> Result<UserStackLayout, error::Error> {
+        let top = self.user_end();
+        self.state.irqsave_lock().init_user_stack(top, size)
+    }
+
+    /// Snapshot of the initial user stack; the address space retains ownership.
+    #[cfg(paging)]
+    pub fn user_stack(&self) -> Option<UserStackLayout> {
+        self.state.irqsave_lock().user_stack
+    }
+
+    /// Copy kernel bytes into this space's initial user stack, without activating it.
+    ///
+    /// The entire destination is checked before copying. Empty writes may use
+    /// the exclusive stack top. All mappings must still be inactive; callers
+    /// must finish initialization before publishing the stack to a user thread.
+    /// This is a preparation interface, not runtime `copy_to_user`.
+    ///
+    /// Returns `ENOENT` without a stack, `EINVAL` for an out-of-stack or
+    /// overflowing range, and `EIO` for inconsistent stack metadata/backing.
+    #[cfg(paging)]
+    pub fn write_user_stack(&self, destination: usize, bytes: &[u8]) -> Result<(), error::Error> {
+        self.state
+            .irqsave_lock()
+            .write_user_stack(destination, bytes)
+    }
+
+    /// Build a native-word ELF-style startup stack in the inactive address space.
+    ///
+    /// Writes `argc`, null-terminated `argv`/`envp` pointer arrays, and `auxv`
+    /// pairs followed by `(AT_NULL, 0)`. Input strings exclude their terminating
+    /// NUL and may contain arbitrary non-NUL bytes. Auxiliary keys must be
+    /// nonzero; values and ABI-specific entries are supplied by the loader.
+    /// The returned SP is 16-byte aligned. No CPU registers are changed.
+    ///
+    /// Validation and backing checks precede all writes, under the state lock.
+    /// A successful rebuild replaces the prior startup image; callers must not
+    /// publish its addresses until preparation is complete.
+    ///
+    /// Returns `ENOENT` without a stack, `EINVAL` for embedded NUL/AT_NULL,
+    /// `ENOSPC` if the image does not fit, or `EIO` for inconsistent backing.
+    #[cfg(paging)]
+    pub fn build_user_stack(
+        &self,
+        argv: &[&[u8]],
+        envp: &[&[u8]],
+        auxv: &[(usize, usize)],
+    ) -> Result<UserStackStart, error::Error> {
+        self.state.irqsave_lock().build_user_stack(argv, envp, auxv)
     }
 
     /// Default lower bound for future mmap address selection.
@@ -185,9 +279,10 @@ impl AddressSpace {
     /// may start below [`Self::mmap_min`]; this only registers metadata.
     pub fn insert(&self, vma: Vma) -> Result<(), error::Error> {
         self.validate_range(vma.start(), vma.end())?;
-        let mut vmas = self.vmas.irqsave_lock();
+        let mut state = self.state.irqsave_lock();
+        let vmas = &mut state.vmas;
         let (start, end) = (vma.start(), vma.end());
-        if Self::overlaps(&vmas, start, end) {
+        if Self::overlaps(vmas, start, end) {
             return Err(error::code::EEXIST);
         }
         vmas.insert(start, vma);
@@ -209,9 +304,14 @@ impl AddressSpace {
     }
 
     /// Remove and return a snapshot of the VMA whose start address equals
-    /// `start`, if any.
+    /// `start`, if any. A managed user-stack or guard VMA remains reserved and
+    /// returns `None`.
     pub fn remove(&self, start: usize) -> Option<Vma> {
-        self.vmas.irqsave_lock().remove(&start)
+        let mut state = self.state.irqsave_lock();
+        if state.manages_vma(start) {
+            return None;
+        }
+        state.vmas.remove(&start)
     }
 
     /// Grow the VMA at `start` so its `end` becomes `new_end` (`> start`).
@@ -222,12 +322,17 @@ impl AddressSpace {
     /// - [`error::code::ENOENT`] — no VMA at `start`.
     /// - [`error::code::EINVAL`] — `new_end <= start`, outside the user range,
     ///   or the grown range would overlap the next VMA.
+    /// - [`error::code::EBUSY`] — the target is a managed user stack or guard.
     pub fn extend_up(&self, start: usize, new_end: usize) -> Result<(), error::Error> {
         use core::ops::Bound::{Excluded, Unbounded};
 
-        let mut vmas = self.vmas.irqsave_lock();
-        let current = vmas.get(&start).copied().ok_or(error::code::ENOENT)?;
+        let mut state = self.state.irqsave_lock();
+        let current = state.vmas.get(&start).copied().ok_or(error::code::ENOENT)?;
+        if state.manages_vma(start) {
+            return Err(error::code::EBUSY);
+        }
         self.validate_range(current.start(), new_end)?;
+        let vmas = &mut state.vmas;
         // Reject overlap with the immediately-following VMA: its start must be
         // >= new_end. The next node's start is the BTreeMap key (free).
         if let Some((next_start, _)) = vmas.range((Excluded(start), Unbounded)).next() {
@@ -245,21 +350,35 @@ impl AddressSpace {
     /// - [`error::code::ENOENT`] — no VMA at `left_start`, or no adjacent
     ///   right VMA.
     /// - [`error::code::EINVAL`] — flag mismatch.
+    /// - [`error::code::EBUSY`] — an operand is a managed user stack or guard.
     pub fn merge_with_next(&self, left_start: usize) -> Result<(), error::Error> {
-        let mut vmas = self.vmas.irqsave_lock();
-        let left = vmas.get(&left_start).ok_or(error::code::ENOENT)?;
+        let mut state = self.state.irqsave_lock();
+        let left = state
+            .vmas
+            .get(&left_start)
+            .copied()
+            .ok_or(error::code::ENOENT)?;
+        if state.manages_vma(left_start) {
+            return Err(error::code::EBUSY);
+        }
 
         let right_start = left.end();
         let left_flags = left.flags();
 
-        let right = vmas
+        let right = state
+            .vmas
             .get(&right_start)
+            .copied()
             .filter(|r| r.start() == right_start)
             .ok_or(error::code::ENOENT)?;
+        if state.manages_vma(right_start) {
+            return Err(error::code::EBUSY);
+        }
         if right.flags() != left_flags {
             return Err(error::code::EINVAL);
         }
 
+        let vmas = &mut state.vmas;
         let new_end = vmas.remove(&right_start).unwrap().end();
         vmas.get_mut(&left_start).unwrap().set_end(new_end)?;
         Ok(())
@@ -271,12 +390,15 @@ impl AddressSpace {
     /// - [`error::code::ENOENT`] — no VMA at `start`.
     /// - [`error::code::EINVAL`] — `addr` is not strictly interior
     ///   (`<= start` or `>= old_end`).
+    /// - [`error::code::EBUSY`] — the target is a managed user stack or guard.
     pub fn split_at(&self, start: usize, addr: usize) -> Result<(), error::Error> {
-        let mut vmas = self.vmas.irqsave_lock();
-        let (old_end, flags) = {
-            let vma = vmas.get(&start).ok_or(error::code::ENOENT)?;
-            (vma.end(), vma.flags())
-        };
+        let mut state = self.state.irqsave_lock();
+        let current = state.vmas.get(&start).copied().ok_or(error::code::ENOENT)?;
+        if state.manages_vma(start) {
+            return Err(error::code::EBUSY);
+        }
+        let vmas = &mut state.vmas;
+        let (old_end, flags) = (current.end(), current.flags());
         if addr >= old_end {
             return Err(error::code::EINVAL);
         }
@@ -288,7 +410,8 @@ impl AddressSpace {
 
     /// Return a snapshot of the [`Vma`] covering `addr`, if any.
     pub fn find_containing(&self, addr: usize) -> Option<Vma> {
-        let vmas = self.vmas.irqsave_lock();
+        let state = self.state.irqsave_lock();
+        let vmas = &state.vmas;
         vmas.range(..=addr)
             .next_back()
             .map(|(_, vma)| *vma)
@@ -302,18 +425,19 @@ impl AddressSpace {
     /// the tree guard and is invalidated once the closure returns — `f` must
     /// not retain the reference.
     pub fn for_each<F: FnMut(&Vma)>(&self, mut f: F) {
-        let vmas = self.vmas.irqsave_lock();
+        let state = self.state.irqsave_lock();
+        let vmas = &state.vmas;
         for vma in vmas.values() {
             f(vma);
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.vmas.irqsave_lock().is_empty()
+        self.state.irqsave_lock().vmas.is_empty()
     }
 
     pub fn count(&self) -> usize {
-        self.vmas.irqsave_lock().len()
+        self.state.irqsave_lock().vmas.len()
     }
 
     /// `true` if a `[start, end)` range would overlap any existing VMA.
