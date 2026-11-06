@@ -14,6 +14,7 @@
 
 //! Structured errors shared by positional reads and loading stages.
 
+use crate::memory::{ProtectionLevel, TargetAddress};
 use core::fmt::Debug;
 
 pub type LoadResult<T> = core::result::Result<T, LoadError>;
@@ -23,12 +24,21 @@ pub enum LoadStage {
     Beginning,
     Admit,
     Inspect,
+    Plan,
+    Allocate,
+    Map,
+    Decode,
+    Relocate,
+    Seal,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoadErrorKind {
     BadElf,
     UnsupportedByProfile,
+    InvalidAlignment,
+    IncorrectLayout,
+    PermissionConflict,
     OutOfBounds,
     IntegerOverflow,
     ResourceLimit,
@@ -48,6 +58,7 @@ pub enum HeaderField {
     Type,
     Machine,
     Flags,
+    Entry,
     HeaderSize,
     ProgramHeaderSize,
     ProgramHeaderCount,
@@ -59,6 +70,8 @@ pub enum ProgramHeaderField {
     Type,
     FileRange,
     VirtualRange,
+    Align,
+    Permissions,
     DuplicateDynamic,
     DuplicatePhdr,
     DuplicateRelro,
@@ -72,6 +85,11 @@ pub enum ProgramHeaderField {
 pub enum LimitKind {
     FileLength,
     ProgramHeaderCount,
+    LoadSegmentCount,
+    ImageSpan,
+    SegmentAlignment,
+    DynamicEntryCount,
+    RelocationCount,
 }
 
 #[non_exhaustive]
@@ -82,6 +100,40 @@ pub enum ErrorContext {
         offset: u64,
         len: u64,
         file_len: u64,
+    },
+    TargetRange {
+        start: TargetAddress,
+        len: u64,
+        align: u64,
+    },
+    TargetBounds {
+        start: TargetAddress,
+        end: TargetAddress,
+    },
+    Allocation {
+        base: TargetAddress,
+        len: u64,
+        align: u64,
+    },
+    MemoryAccess {
+        allocation_base: TargetAddress,
+        allocation_len: u64,
+        allocation_align: u64,
+        offset: u64,
+        len: u64,
+    },
+    DynamicTag {
+        tag: u64,
+        value: u64,
+    },
+    Relocation {
+        target: TargetAddress,
+        raw_type: u32,
+        symbol_index: u32,
+    },
+    Protection {
+        required: ProtectionLevel,
+        provided: ProtectionLevel,
     },
     HeaderField {
         field: HeaderField,
@@ -106,6 +158,40 @@ pub struct LoadError {
 }
 
 impl LoadError {
+    /// Identify a relocation record independently of its source table format.
+    pub(crate) fn relocation(
+        target: TargetAddress,
+        raw_type: u32,
+        symbol_index: u32,
+        kind: LoadErrorKind,
+    ) -> Self {
+        Self::new(
+            kind,
+            ErrorContext::Relocation {
+                target,
+                raw_type,
+                symbol_index,
+            },
+        )
+    }
+
+    /// Describe a program-header failure without coupling loading stages.
+    pub(crate) fn program_header(
+        index: u16,
+        field: ProgramHeaderField,
+        value: u64,
+        kind: LoadErrorKind,
+    ) -> LoadError {
+        LoadError::new(
+            kind,
+            ErrorContext::ProgramHeader {
+                index,
+                field,
+                value,
+            },
+        )
+    }
+
     #[inline]
     pub const fn new(kind: LoadErrorKind, context: ErrorContext) -> Self {
         Self {

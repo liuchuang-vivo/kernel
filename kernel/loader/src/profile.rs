@@ -15,82 +15,28 @@
 //! Caller-supplied ELF architecture, ABI and admission policies, and resource limits.
 
 use crate::{
-    error::{ErrorContext, LimitKind, LoadErrorKind, ProgramHeaderField},
+    elf::{DynamicInfo, ElfHeaderInfo, ElfType, RelocationAddend, RelocationRecord},
+    error::{ErrorContext, HeaderField, LimitKind, LoadErrorKind, ProgramHeaderField},
+    memory::{MemoryPermissions, ProtectionLevel},
     LoadError, LoadResult,
 };
 use goblin::elf::{
-    header::{
-        ELFCLASS32, ELFCLASS64, ELFDATA2LSB, ELFDATA2MSB, EM_AARCH64, EM_RISCV, ET_DYN, ET_EXEC,
+    dynamic::{
+        DF_1_NOW, DF_1_PIE, DF_BIND_NOW, DT_BIND_NOW, DT_DEBUG, DT_FINI, DT_FINI_ARRAY,
+        DT_FINI_ARRAYSZ, DT_FLAGS, DT_FLAGS_1, DT_GNU_HASH, DT_HASH, DT_INIT, DT_INIT_ARRAY,
+        DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED, DT_PLTGOT, DT_PLTREL, DT_PLTRELSZ, DT_PREINIT_ARRAY,
+        DT_PREINIT_ARRAYSZ, DT_REL, DT_RELA, DT_RELACOUNT, DT_RELAENT, DT_RELASZ, DT_RELCOUNT,
+        DT_RELENT, DT_RELSZ, DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB,
     },
+    header::{ELFOSABI_GNU, ELFOSABI_NONE},
     program_header::{
-        PF_X, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_NOTE,
-        PT_NULL, PT_PHDR, PT_TLS,
+        PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP,
+        PT_LOAD, PT_NOTE, PT_NULL, PT_PHDR, PT_TLS,
     },
+    reloc::{R_AARCH64_NONE, R_AARCH64_RELATIVE, R_RISCV_NONE, R_RISCV_RELATIVE},
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ElfClass {
-    Elf32,
-    Elf64,
-}
-
-impl From<ElfClass> for u64 {
-    fn from(value: ElfClass) -> Self {
-        match value {
-            ElfClass::Elf32 => u64::from(ELFCLASS32),
-            ElfClass::Elf64 => u64::from(ELFCLASS64),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ElfData {
-    Little,
-    Big,
-}
-
-impl From<ElfData> for u64 {
-    fn from(value: ElfData) -> Self {
-        match value {
-            ElfData::Little => u64::from(ELFDATA2LSB),
-            ElfData::Big => u64::from(ELFDATA2MSB),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ElfType {
-    Dyn,
-    Exec,
-    Other(u16),
-}
-
-impl From<ElfType> for u64 {
-    fn from(value: ElfType) -> Self {
-        match value {
-            ElfType::Dyn => u64::from(ET_DYN),
-            ElfType::Exec => u64::from(ET_EXEC),
-            ElfType::Other(value) => u64::from(value),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ElfMachine {
-    Riscv,
-    Aarch64,
-    Other(u16),
-}
-
-impl From<ElfMachine> for u64 {
-    fn from(value: ElfMachine) -> Self {
-        match value {
-            ElfMachine::Riscv => u64::from(EM_RISCV),
-            ElfMachine::Aarch64 => u64::from(EM_AARCH64),
-            ElfMachine::Other(x) => u64::from(x),
-        }
-    }
-}
+pub use crate::elf::{ElfClass, ElfData, ElfMachine};
 
 /// RISC-V `e_flags` bits the loader interprets. The float ABI must be soft for
 /// the current RISC-V profiles; the embedded (RVE) register model is unsupported.
@@ -146,10 +92,46 @@ impl HeaderFlagsPolicy {
     }
 }
 
+/// Dynamic tags understood by this loader. Indices also identify singleton tags.
+pub(crate) const DYNAMIC_TAGS: [u64; 32] = [
+    DT_NEEDED,
+    DT_PLTRELSZ,
+    DT_PLTGOT,
+    DT_HASH,
+    DT_STRTAB,
+    DT_SYMTAB,
+    DT_RELA,
+    DT_RELASZ,
+    DT_RELAENT,
+    DT_STRSZ,
+    DT_SYMENT,
+    DT_INIT,
+    DT_FINI,
+    DT_SONAME,
+    DT_REL,
+    DT_RELSZ,
+    DT_RELENT,
+    DT_PLTREL,
+    DT_DEBUG,
+    DT_JMPREL,
+    DT_BIND_NOW,
+    DT_INIT_ARRAY,
+    DT_FINI_ARRAY,
+    DT_INIT_ARRAYSZ,
+    DT_FINI_ARRAYSZ,
+    DT_PREINIT_ARRAY,
+    DT_PREINIT_ARRAYSZ,
+    DT_FLAGS,
+    DT_FLAGS_1,
+    DT_GNU_HASH,
+    DT_RELACOUNT,
+    DT_RELCOUNT,
+];
+
 /// Caller-defined program-header admission policy.
 ///
-/// `new()` replaces the base whitelist. A profile can also retain that list
-/// and configure additional types for one load. Accepting metadata does not
+/// `new()` replaces the base whitelist. `with_additional_types()` retains
+/// that list and configures additional types. Accepting metadata does not
 /// implement its runtime semantics; matching loading and stack support are
 /// still required before executing the image.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,6 +159,13 @@ impl ProgramHeaderPolicy {
         self.additional_types
     }
 
+    /// Replace additional types while retaining the base whitelist and stack policy.
+    /// An empty slice clears the extension list.
+    pub const fn with_additional_types(mut self, types: &'static [u32]) -> Self {
+        self.additional_types = types;
+        self
+    }
+
     /// Change stack admission while retaining the program-header whitelist.
     pub const fn with_executable_stack(mut self, allowed: bool) -> Self {
         self.executable_stack = allowed;
@@ -189,6 +178,57 @@ impl ProgramHeaderPolicy {
 
     const fn accepts_stack_flags(&self, flags: u32) -> bool {
         self.executable_stack || flags & PF_X == 0
+    }
+}
+
+/// Admission policy for exact PT_LOAD permission combinations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SegmentPermissionPolicy {
+    // Eight bits cover all combinations of the three logical R/W/X flags.
+    allowed_combinations: u8,
+}
+
+impl SegmentPermissionPolicy {
+    pub const DEFAULT: Self = Self::new(&[
+        MemoryPermissions::READ,
+        MemoryPermissions::READ.bitor(MemoryPermissions::EXECUTE),
+        MemoryPermissions::READ.bitor(MemoryPermissions::WRITE),
+    ]);
+
+    /// Replace the whitelist; the input slice is consumed into a bit set.
+    pub const fn new(allowed: &[MemoryPermissions]) -> Self {
+        let mut policy = Self {
+            allowed_combinations: 0,
+        };
+        let mut index = 0;
+        while index < allowed.len() {
+            policy = policy.with_permissions(allowed[index], true);
+            index += 1;
+        }
+        policy
+    }
+
+    /// Allow or deny one exact combination without changing the others.
+    #[inline]
+    pub const fn with_permissions(mut self, permissions: MemoryPermissions, allowed: bool) -> Self {
+        let bit = 1u8 << permissions.bits();
+        if allowed {
+            self.allowed_combinations |= bit;
+        } else {
+            self.allowed_combinations &= !bit;
+        }
+        self
+    }
+
+    #[inline]
+    pub const fn accepts(self, permissions: MemoryPermissions) -> bool {
+        self.allowed_combinations & (1u8 << permissions.bits()) != 0
+    }
+}
+
+impl Default for SegmentPermissionPolicy {
+    fn default() -> Self {
+        Self::DEFAULT
     }
 }
 
@@ -239,9 +279,162 @@ pub struct LoadProfile {
     header_flags: HeaderFlagsPolicy,
     entry_mode: EntryMode,
     program_headers: ProgramHeaderPolicy,
+    segment_permissions: SegmentPermissionPolicy,
+    required_protection: ProtectionLevel,
 }
 
 impl LoadProfile {
+    pub const fn required_protection(&self) -> ProtectionLevel {
+        self.required_protection
+    }
+
+    /// Require hardware enforcement, or permit the flat backend's logical policy.
+    pub const fn with_required_protection(mut self, level: ProtectionLevel) -> Self {
+        self.required_protection = level;
+        self
+    }
+
+    pub(crate) fn check_protection_level(&self, provided: ProtectionLevel) -> LoadResult<()> {
+        if self.required_protection == ProtectionLevel::HardwareEnforced
+            && provided != ProtectionLevel::HardwareEnforced
+        {
+            return Err(LoadError::new(
+                LoadErrorKind::UnsupportedByProfile,
+                ErrorContext::Protection {
+                    required: self.required_protection,
+                    provided,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Admit currently implemented single-image operations and explicit addends.
+    /// `None` denotes a no-op; `Some` supplies the RELATIVE addend.
+    pub(crate) fn check_relative_relocation(
+        &self,
+        record: &RelocationRecord,
+    ) -> LoadResult<Option<i64>> {
+        let unsupported = || {
+            LoadError::relocation(
+                record.offset,
+                record.raw_type,
+                record.symbol_index,
+                LoadErrorKind::UnsupportedByProfile,
+            )
+        };
+        let (none, relative) = match (self.machine, self.class) {
+            (ElfMachine::Riscv, ElfClass::Elf32 | ElfClass::Elf64) => {
+                (R_RISCV_NONE, R_RISCV_RELATIVE)
+            }
+            (ElfMachine::Aarch64, ElfClass::Elf64) => (R_AARCH64_NONE, R_AARCH64_RELATIVE),
+            _ => return Err(unsupported()),
+        };
+        if record.raw_type == none {
+            return Ok(None);
+        }
+        if record.raw_type != relative {
+            return Err(unsupported());
+        }
+        match record.addend {
+            RelocationAddend::Explicit(addend) => Ok(Some(addend)),
+            RelocationAddend::Implicit => Err(unsupported()),
+        }
+    }
+
+    /// Admit the OS ABI without treating a recognized but unsupported ABI as malformed ELF.
+    pub(crate) fn check_ident_abi(&self, osabi: u8, abi_version: u8) -> LoadResult<()> {
+        if !matches!(osabi, ELFOSABI_NONE | ELFOSABI_GNU) {
+            return Err(unsupported_header(HeaderField::OsAbi, u64::from(osabi)));
+        }
+        if abi_version != 0 {
+            return Err(unsupported_header(
+                HeaderField::AbiVersion,
+                u64::from(abi_version),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Match structurally decoded header facts against the implemented profile.
+    pub(crate) fn check_header(&self, header: &ElfHeaderInfo) -> LoadResult<()> {
+        if !matches!(header.r#type(), ElfType::Dyn | ElfType::Exec) {
+            return Err(unsupported_header(
+                HeaderField::Type,
+                u64::from(header.r#type()),
+            ));
+        }
+        if header.class() != self.class() {
+            return Err(unsupported_header(
+                HeaderField::Class,
+                u64::from(header.class()),
+            ));
+        }
+        if header.endian() != self.endian() {
+            return Err(unsupported_header(
+                HeaderField::Endian,
+                u64::from(header.endian()),
+            ));
+        }
+        if header.machine() != self.machine() {
+            return Err(unsupported_header(
+                HeaderField::Machine,
+                u64::from(header.machine()),
+            ));
+        }
+        // `e_flags` is machine-defined; a trusted profile always carries a
+        // HeaderFlagsPolicy for its machine, so an unknown ABI/float/RVE
+        // combination fails admission before any allocation.
+        if !self.header_flags().accepts(header.flags()) {
+            return Err(unsupported_header(
+                HeaderField::Flags,
+                u64::from(header.flags()),
+            ));
+        }
+        // PN_XNUM stores the real count in section header zero. This pipeline
+        // reads program headers directly and does not support extended numbering.
+        if header.program_header_count() == u16::MAX {
+            return Err(unsupported_header(
+                HeaderField::ProgramHeaderCount,
+                u64::from(header.program_header_count()),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check whether this image type can serve the requested loading purpose.
+    pub(crate) fn check_image_type(
+        &self,
+        purpose: LoadPurpose,
+        elf_type: ElfType,
+    ) -> LoadResult<()> {
+        if purpose == LoadPurpose::SharedObject && elf_type != ElfType::Dyn {
+            return Err(unsupported_header(HeaderField::Type, u64::from(elf_type)));
+        }
+        Ok(())
+    }
+
+    /// Reject runtime semantics not provided by the selected loading profile.
+    pub(crate) fn check_dynamic_image(
+        &self,
+        purpose: LoadPurpose,
+        dynamic: &DynamicInfo,
+    ) -> LoadResult<()> {
+        if let Some(address) = dynamic.value(DT_JMPREL) {
+            self.check_plt_binding(address, dynamic.bind_now())?;
+        }
+        if purpose == LoadPurpose::SharedObject && dynamic.is_pie() {
+            return Err(LoadError::new(
+                LoadErrorKind::UnsupportedByProfile,
+                ErrorContext::DynamicTag {
+                    tag: DT_FLAGS_1,
+                    value: dynamic.value(DT_FLAGS_1).unwrap_or(0),
+                },
+            ));
+        }
+        Ok(())
+    }
+
     #[inline]
     pub const fn new(
         class: ElfClass,
@@ -256,6 +449,8 @@ impl LoadProfile {
             machine,
             header_flags,
             entry_mode,
+            segment_permissions: SegmentPermissionPolicy::DEFAULT,
+            required_protection: ProtectionLevel::LogicalOnly,
             program_headers: ProgramHeaderPolicy::new(
                 match machine {
                     ElfMachine::Riscv => DEFAULT_PROGRAM_HEADERS,
@@ -349,15 +544,22 @@ impl LoadProfile {
         self
     }
 
-    /// Set additional accepted types while retaining the base whitelist and stack policy.
-    /// Calling this again replaces the extension list; an empty list clears it.
-    pub const fn set_additional_program_headers(&mut self, types: &'static [u32]) {
-        self.program_headers.additional_types = types;
+    #[inline]
+    pub const fn segment_permission_policy(&self) -> SegmentPermissionPolicy {
+        self.segment_permissions
     }
 
-    /// Configure additional types when constructing a profile.
+    /// Change PT_LOAD admission without changing program-header or stack policy.
+    #[inline]
+    pub const fn with_segment_permission_policy(mut self, policy: SegmentPermissionPolicy) -> Self {
+        self.segment_permissions = policy;
+        self
+    }
+
+    /// Configure additional types while retaining the base whitelist and stack policy.
+    /// Calling this again replaces the extension list; an empty list clears it.
     pub const fn with_additional_program_headers(mut self, types: &'static [u32]) -> Self {
-        self.set_additional_program_headers(types);
+        self.program_headers = self.program_headers.with_additional_types(types);
         self
     }
 
@@ -380,6 +582,89 @@ impl LoadProfile {
         ))
     }
 
+    pub(crate) fn check_segment_permissions(
+        &self,
+        index: u16,
+        flags: u32,
+    ) -> LoadResult<MemoryPermissions> {
+        let mut permissions = MemoryPermissions::NONE;
+        for (flag, permission) in [
+            (PF_R, MemoryPermissions::READ),
+            (PF_W, MemoryPermissions::WRITE),
+            (PF_X, MemoryPermissions::EXECUTE),
+        ] {
+            if flags & flag != 0 {
+                permissions = permissions.bitor(permission);
+            }
+        }
+        if self.segment_permissions.accepts(permissions) {
+            return Ok(permissions);
+        }
+        let kind = if permissions.contains(MemoryPermissions::WRITE)
+            && permissions.contains(MemoryPermissions::EXECUTE)
+        {
+            LoadErrorKind::PermissionConflict
+        } else {
+            LoadErrorKind::UnsupportedByProfile
+        };
+        Err(LoadError::new(
+            kind,
+            ErrorContext::ProgramHeader {
+                index,
+                field: ProgramHeaderField::Permissions,
+                value: u64::from(flags),
+            },
+        ))
+    }
+
+    /// Header admission alone cannot enable unimplemented runtime semantics.
+    pub(crate) fn check_runtime_program_header(&self, index: u16, kind: u32) -> LoadResult<()> {
+        let field = match kind {
+            PT_INTERP => ProgramHeaderField::UnsupportedInterpreter,
+            PT_TLS => ProgramHeaderField::UnsupportedTls,
+            _ => return Ok(()),
+        };
+        Err(LoadError::new(
+            LoadErrorKind::UnsupportedByProfile,
+            ErrorContext::ProgramHeader {
+                index,
+                field,
+                value: u64::from(kind),
+            },
+        ))
+    }
+
+    /// Accept implemented dynamic semantics and return its singleton bit.
+    pub(crate) fn check_dynamic_tag(&self, tag: u64, value: u64) -> LoadResult<u64> {
+        let index = DYNAMIC_TAGS.iter().position(|candidate| *candidate == tag);
+        let flags_supported = match tag {
+            DT_FLAGS => value & !DF_BIND_NOW == 0,
+            DT_FLAGS_1 => value & !(DF_1_NOW | DF_1_PIE) == 0,
+            _ => true,
+        };
+        match index {
+            Some(index) if flags_supported => Ok(1u64 << index),
+            _ => Err(LoadError::new(
+                LoadErrorKind::UnsupportedByProfile,
+                ErrorContext::DynamicTag { tag, value },
+            )),
+        }
+    }
+
+    /// Current loading profiles require immediate binding for PLT relocations.
+    fn check_plt_binding(&self, address: u64, bind_now: bool) -> LoadResult<()> {
+        if bind_now {
+            return Ok(());
+        }
+        Err(LoadError::new(
+            LoadErrorKind::UnsupportedByProfile,
+            ErrorContext::DynamicTag {
+                tag: DT_JMPREL,
+                value: address,
+            },
+        ))
+    }
+
     pub(crate) fn check_stack_flags(&self, index: u16, flags: u32) -> LoadResult<()> {
         if self.program_headers.accepts_stack_flags(flags) {
             return Ok(());
@@ -395,21 +680,104 @@ impl LoadProfile {
     }
 }
 
-/// Per-image bounds checked before reading or retaining header metadata.
+/// Per-image resource bounds; these limits do not preallocate image backing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LoadLimits {
     max_file_len: u64,
     max_program_headers: u16,
+    max_load_segments: u16,
+    max_image_span: u64,
+    max_segment_alignment: u64,
+    // Includes the terminating DT_NULL; storage grows only for preceding entries.
+    max_dynamic_entries: u64,
+    // Counts unique records after normalizing overlapping main/PLT tables.
+    max_relocations: u64,
 }
 
 impl LoadLimits {
-    pub const DEFAULT: Self = Self::new(64 * 1024 * 1024, 128);
+    pub const DEFAULT: Self = Self::new(
+        64 * 1024 * 1024,
+        128,
+        32,
+        64 * 1024 * 1024,
+        1024 * 1024 * 1024,
+        1024,
+        64 * 1024,
+    );
 
-    pub const fn new(max_file_len: u64, max_program_headers: u16) -> Self {
+    #[inline]
+    pub const fn new(
+        max_file_len: u64,
+        max_program_headers: u16,
+        max_load_segments: u16,
+        max_image_span: u64,
+        max_segment_alignment: u64,
+        max_dynamic_entries: u64,
+        max_relocations: u64,
+    ) -> Self {
         Self {
             max_file_len,
             max_program_headers,
+            max_load_segments,
+            max_image_span,
+            max_segment_alignment,
+            max_dynamic_entries,
+            max_relocations,
         }
+    }
+
+    #[inline]
+    pub const fn with_max_file_len(mut self, maximum: u64) -> Self {
+        self.max_file_len = maximum;
+        self
+    }
+
+    #[inline]
+    pub const fn with_max_program_headers(mut self, maximum: u16) -> Self {
+        self.max_program_headers = maximum;
+        self
+    }
+
+    #[inline]
+    pub const fn with_max_load_segments(mut self, maximum: u16) -> Self {
+        self.max_load_segments = maximum;
+        self
+    }
+
+    #[inline]
+    pub const fn with_max_image_span(mut self, maximum: u64) -> Self {
+        self.max_image_span = maximum;
+        self
+    }
+
+    #[inline]
+    pub const fn with_max_segment_alignment(mut self, maximum: u64) -> Self {
+        self.max_segment_alignment = maximum;
+        self
+    }
+
+    #[inline]
+    pub const fn with_max_dynamic_entries(mut self, maximum: u64) -> Self {
+        self.max_dynamic_entries = maximum;
+        self
+    }
+
+    #[inline]
+    pub const fn with_max_relocations(mut self, maximum: u64) -> Self {
+        self.max_relocations = maximum;
+        self
+    }
+
+    pub fn check_dynamic_entry_count(&self, actual: u64) -> LoadResult<()> {
+        check_limit(
+            LimitKind::DynamicEntryCount,
+            actual,
+            self.max_dynamic_entries,
+        )
+    }
+
+    pub fn check_relocation_count(&self, actual: u64) -> LoadResult<()> {
+        check_limit(LimitKind::RelocationCount, actual, self.max_relocations)
     }
 
     pub fn check_file_len(&self, actual: u64) -> LoadResult<()> {
@@ -422,6 +790,32 @@ impl LoadLimits {
             u64::from(actual),
             u64::from(self.max_program_headers),
         )
+    }
+
+    pub fn check_load_segment_count(&self, actual: usize) -> LoadResult<()> {
+        check_limit(
+            LimitKind::LoadSegmentCount,
+            actual as u64,
+            u64::from(self.max_load_segments),
+        )
+    }
+
+    pub fn check_image_span(&self, actual: u64) -> LoadResult<()> {
+        check_limit(LimitKind::ImageSpan, actual, self.max_image_span)
+    }
+
+    pub fn check_segment_alignment(&self, actual: u64) -> LoadResult<()> {
+        check_limit(
+            LimitKind::SegmentAlignment,
+            actual,
+            self.max_segment_alignment,
+        )
+    }
+}
+
+impl Default for LoadLimits {
+    fn default() -> Self {
+        Self::DEFAULT
     }
 }
 
@@ -439,22 +833,16 @@ fn check_limit(resource: LimitKind, actual: u64, maximum: u64) -> LoadResult<()>
     ))
 }
 
+/// Whether loading requires an application entry or a loadable shared object.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct LoadRequest {
-    profile: LoadProfile,
-    limits: LoadLimits,
+pub enum LoadPurpose {
+    Executable,
+    SharedObject,
 }
 
-impl LoadRequest {
-    pub const fn new(profile: LoadProfile, limits: LoadLimits) -> Self {
-        Self { profile, limits }
-    }
-
-    pub const fn profile(&self) -> &LoadProfile {
-        &self.profile
-    }
-
-    pub const fn limits(&self) -> &LoadLimits {
-        &self.limits
-    }
+fn unsupported_header(field: HeaderField, value: u64) -> LoadError {
+    LoadError::new(
+        LoadErrorKind::UnsupportedByProfile,
+        ErrorContext::HeaderField { field, value },
+    )
 }
