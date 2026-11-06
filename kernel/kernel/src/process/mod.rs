@@ -147,7 +147,6 @@ impl ProcessManager {
         if p.pid() != ROOT_PID {
             reparent_orphans_to_root(&self.root, p);
         }
-        // TODO: release AddressSpace resource
         p.become_dead();
         removed
     }
@@ -233,7 +232,7 @@ pub struct Process {
     topology: SpinLock<ProcessTopology>,
     // The threads owned by this process.
     threads: SpinLock<ThreadList>,
-    // This process's independent address space
+    // This process's independent address space.
     address_space: Arc<AddressSpace>,
     // This process's open-file table.
     #[cfg(enable_vfs)]
@@ -247,7 +246,7 @@ pub struct Process {
 // storage is never moved or dropped, and every field that can be touched
 // concurrently (`topology`, `threads`, `fd_manager`) is already guarded by a
 // `SpinLock` whose irqsave read/write guards serialize access. The remaining
-// field (`pid`) is plain `Send + Sync`. So it is sound to move the owning
+// fields (`pid`, `address_space`) are `Send + Sync`. So it is sound to move the owning
 // `Arc<Process>` between threads and to share `&Process` across cores — which
 // the scheduler already relies on for the root process. This unlocks
 // `Once<Arc<Process>>` (the `root` field) and `Once<ProcessManager>` as
@@ -265,7 +264,7 @@ impl Process {
                 state: ProcessState::Alive,
             }),
             threads: SpinLock::new(ThreadList::new()),
-            address_space: Arc::new(AddressSpace::new()),
+            address_space: Arc::new(AddressSpace::new()?),
 
             #[cfg(enable_vfs)]
             fd_manager: SpinLock::new(FdManager::new()),
@@ -466,11 +465,15 @@ mod tests {
         assert_ne!(child.pid(), root.pid());
         assert_eq!(child.parent().map(|p| p.pid()), Some(ROOT_PID));
 
-        // Every process is born with an empty, independent address space.
+        // Every process owns an empty, independent address space.
         assert!(root.address_space().is_empty());
         assert!(child.address_space().is_empty());
-        // Root and child do not share an address space.
         assert!(!Arc::ptr_eq(root.address_space(), child.address_space()));
+        #[cfg(paging)]
+        assert_ne!(
+            root.address_space().root_address(),
+            child.address_space().root_address(),
+        );
 
         // When VFS is enabled, every process also owns an independent
         // per-process open-file table. The syscall path resolves each

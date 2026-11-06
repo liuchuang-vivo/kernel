@@ -14,54 +14,46 @@
 
 extern crate alloc;
 
+#[cfg(paging)]
+mod user_stack;
+#[cfg(paging)]
+pub use user_stack::UserStackLayout;
+#[cfg(paging)]
+mod stack_startup;
+#[cfg(paging)]
+pub use stack_startup::UserStackStart;
+
+#[cfg(paging)]
 use crate::{
-    error,
-    sync::{Mutex, MutexGuard},
-    types::Arc,
+    arch::page::PageEntry,
+    mm::{
+        paging::{
+            first_fit::FirstFitFrameAllocator, mapper::PageMapper, FrameAllocator, PageFormat,
+        },
+        PhysicalAddress,
+    },
 };
+use crate::{error, mm::MemFlags, sync::SpinLock};
 use alloc::collections::BTreeMap;
-use core::cell::UnsafeCell;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct MmapFlags(u8);
+#[cfg(paging)]
+pub const MMAP_MIN_DEFAULT: usize = PageEntry::PAGE_SIZE;
+// Automatic-placement preference; explicit reservations may use lower addresses.
+#[cfg(not(paging))]
+pub const MMAP_MIN_DEFAULT: usize = 4096;
 
-impl MmapFlags {
-    pub const READ: Self = Self(1 << 0);
-    pub const WRITE: Self = Self(1 << 1);
-    pub const EXECUTE: Self = Self(1 << 2);
-
-    pub const fn empty() -> Self {
-        Self(0)
-    }
-
-    pub const fn contains(self, requested: Self) -> bool {
-        self.0 & requested.0 == requested.0
-    }
-
-    pub const fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
-}
-
-impl core::ops::BitOr for MmapFlags {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
-}
-
-/// A contiguous virtual-address range `[start, end)`.
+/// A contiguous virtual-address range `[start, end)`
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Vma {
     start: usize,
     end: usize,
-    flags: MmapFlags,
+    flags: MemFlags,
 }
 
 impl Vma {
     /// Returns [`error::code::EINVAL`] if the range is empty or inverted
     /// (`start >= end`).
-    pub const fn new(start: usize, end: usize, flags: MmapFlags) -> Result<Self, error::Error> {
+    pub const fn new(start: usize, end: usize, flags: MemFlags) -> Result<Self, error::Error> {
         if start >= end {
             return Err(error::code::EINVAL);
         }
@@ -76,7 +68,7 @@ impl Vma {
         self.end
     }
 
-    pub fn flags(&self) -> MmapFlags {
+    pub fn flags(&self) -> MemFlags {
         self.flags
     }
 
@@ -113,167 +105,313 @@ impl Vma {
         Ok(())
     }
 
-    pub(crate) fn set_flags(&mut self, flags: MmapFlags) {
+    pub(crate) fn set_flags(&mut self, flags: MemFlags) {
         self.flags = flags;
     }
 }
 
-/// Debug-only guard for the [`AddressSpace`] re-entrancy
-macro_rules! assert_not_reentrant {
-    ($aspace:expr) => {
-        debug_assert!(
-            !$aspace.lock.is_recursively_held(),
-            "re-entrant AddressSpace access (nesting_count > 1) \
-             — a method was called while the tree mutex was already held \
-             by this thread (e.g. from within a for_each closure)"
-        );
-    };
+#[cfg(paging)]
+#[must_use = "dropping the state releases its inactive mappings and tables"]
+struct AddressSpaceState<F: FrameAllocator> {
+    vmas: BTreeMap<usize, Vma>,
+    mapper: PageMapper<F>,
+    user_stack: Option<UserStackLayout>,
 }
+
+#[cfg(not(paging))]
+struct AddressSpaceState {
+    vmas: BTreeMap<usize, Vma>,
+}
+
+#[cfg(not(paging))]
+impl AddressSpaceState {
+    fn manages_vma(&self, _start: usize) -> bool {
+        false
+    }
+}
+
+#[cfg(paging)]
+type State = AddressSpaceState<&'static FirstFitFrameAllocator>;
+#[cfg(not(paging))]
+type State = AddressSpaceState;
 
 /// A process's independent virtual address space.
+///
+/// Paging spaces own inactive page tables and any initialized user-stack backing.
+/// Destruction releases backing before the tables. Hardware activation and TLB
+/// lifetime management must be integrated before installing the root on a CPU.
+#[must_use = "dropping an address space releases its inactive mappings and tables"]
 pub struct AddressSpace {
-    lock: Arc<Mutex>,
-    vmas: UnsafeCell<BTreeMap<usize, Vma>>,
+    state: SpinLock<State>,
+    mmap_min: usize,
 }
 
-// SAFETY: `vmas` is an `UnsafeCell`, so `AddressSpace` gets no auto `Send` or
-// `Sync`. Both are safe to promise by hand: all access to `vmas` funnels
-// through `Self::lock` (`lock.lock_guard(&self.vmas)`), and the returned
-// `MutexGuard` hands out `&mut BTreeMap` only while the mutex is held. The
-// `BTreeMap` never escapes the guard (methods return `Vma` snapshots), so no
-// unsynchronized access can exist.
-//
-// Note the lock itself: `Mutex` is already `Sync` (its state is
-// atomic/spin-guarded) and is deliberately `!Send` because the PI chain's
-// waitqueue bookkeeping assumes the mutex stays put — that is satisfied here
-// since the `Arc<Mutex>` pins it. `Send` for `AddressSpace` requires moving
-// the `Arc<Mutex>` handle (cheap, sound) — never the `Mutex` out of its
-// allocation.
-unsafe impl Send for AddressSpace {}
-unsafe impl Sync for AddressSpace {}
-
 impl AddressSpace {
-    pub fn new() -> Self {
-        Self {
-            lock: Mutex::create(),
-            vmas: UnsafeCell::new(BTreeMap::new()),
+    /// Create an empty address space without changing the active CPU mappings.
+    ///
+    /// Paging systems require the boot frame allocator and kernel direct map
+    /// to be initialized. Returns [`error::code::ENOMEM`] if no root-table frame
+    /// can be allocated.
+    pub fn new() -> Result<Self, error::Error> {
+        #[cfg(paging)]
+        {
+            Self::new_with_allocator(FirstFitFrameAllocator::instance())
         }
+        #[cfg(not(paging))]
+        {
+            Ok(Self {
+                state: SpinLock::new(AddressSpaceState {
+                    vmas: BTreeMap::new(),
+                }),
+                mmap_min: MMAP_MIN_DEFAULT,
+            })
+        }
+    }
+
+    #[cfg(paging)]
+    fn new_with_allocator(
+        allocator: &'static FirstFitFrameAllocator,
+    ) -> Result<Self, error::Error> {
+        Ok(Self {
+            state: SpinLock::new(AddressSpaceState::new(allocator)?),
+            mmap_min: MMAP_MIN_DEFAULT,
+        })
+    }
+
+    /// Physical root of this space's inactive user page table.
+    #[cfg(paging)]
+    pub fn root_address(&self) -> PhysicalAddress {
+        self.state.irqsave_lock().mapper.root_address()
+    }
+
+    /// Allocate a fixed-size initial user stack at the user address limit.
+    ///
+    /// The usable size must be a nonzero page multiple. One additional lower
+    /// guard page is reserved but remains unmapped. Stack pages are zeroed,
+    /// user-readable/writable and non-executable. The table must remain inactive;
+    /// this does not set a CPU stack pointer or write a process startup frame.
+    ///
+    /// # Errors
+    /// - [`error::code::EINVAL`] — invalid size or insufficient address range.
+    /// - [`error::code::EEXIST`] — a stack exists or either reservation overlaps.
+    /// - [`error::code::ENOMEM`] — backing or page-table frame allocation failed.
+    #[cfg(paging)]
+    pub fn init_user_stack(&self, size: usize) -> Result<UserStackLayout, error::Error> {
+        let top = self.user_end();
+        self.state.irqsave_lock().init_user_stack(top, size)
+    }
+
+    /// Snapshot of the initial user stack; the address space retains ownership.
+    #[cfg(paging)]
+    pub fn user_stack(&self) -> Option<UserStackLayout> {
+        self.state.irqsave_lock().user_stack
+    }
+
+    /// Copy kernel bytes into this space's initial user stack, without activating it.
+    ///
+    /// The entire destination is checked before copying. Empty writes may use
+    /// the exclusive stack top. All mappings must still be inactive; callers
+    /// must finish initialization before publishing the stack to a user thread.
+    /// This is a preparation interface, not runtime `copy_to_user`.
+    ///
+    /// Returns `ENOENT` without a stack, `EINVAL` for an out-of-stack or
+    /// overflowing range, and `EIO` for inconsistent stack metadata/backing.
+    #[cfg(paging)]
+    pub fn write_user_stack(&self, destination: usize, bytes: &[u8]) -> Result<(), error::Error> {
+        self.state
+            .irqsave_lock()
+            .write_user_stack(destination, bytes)
+    }
+
+    /// Build a native-word ELF-style startup stack in the inactive address space.
+    ///
+    /// Writes `argc`, null-terminated `argv`/`envp` pointer arrays, and `auxv`
+    /// pairs followed by `(AT_NULL, 0)`. Input strings exclude their terminating
+    /// NUL and may contain arbitrary non-NUL bytes. Auxiliary keys must be
+    /// nonzero; values and ABI-specific entries are supplied by the loader.
+    /// The returned SP is 16-byte aligned. No CPU registers are changed.
+    ///
+    /// Validation and backing checks precede all writes, under the state lock.
+    /// A successful rebuild replaces the prior startup image; callers must not
+    /// publish its addresses until preparation is complete.
+    ///
+    /// Returns `ENOENT` without a stack, `EINVAL` for embedded NUL/AT_NULL,
+    /// `ENOSPC` if the image does not fit, or `EIO` for inconsistent backing.
+    #[cfg(paging)]
+    pub fn build_user_stack(
+        &self,
+        argv: &[&[u8]],
+        envp: &[&[u8]],
+        auxv: &[(usize, usize)],
+    ) -> Result<UserStackStart, error::Error> {
+        self.state.irqsave_lock().build_user_stack(argv, envp, auxv)
+    }
+
+    /// Default lower bound for future mmap address selection.
+    pub fn mmap_min(&self) -> usize {
+        self.mmap_min
+    }
+
+    /// Exclusive upper bound for this space's virtual-address intervals.
+    pub fn user_end(&self) -> usize {
+        #[cfg(paging)]
+        {
+            1usize << PageEntry::VIRT_ADDR_BITS
+        }
+        #[cfg(not(paging))]
+        {
+            usize::MAX
+        }
+    }
+
+    fn validate_range(&self, start: usize, end: usize) -> Result<(), error::Error> {
+        if start >= end || end > self.user_end() {
+            return Err(error::code::EINVAL);
+        }
+        Ok(())
     }
 
     /// Insert `vma` into this address space.
     ///
-    /// Returns [`EEXIST`] if the new range overlaps an existing
-    /// VMA. On failure the space is left unchanged.
+    /// Returns [`error::code::EINVAL`] if the range is outside the user address
+    /// space, or [`error::code::EEXIST`] if it overlaps an existing VMA. On
+    /// failure the space is left unchanged. Byte-granular explicit reservations
+    /// may start below [`Self::mmap_min`]; this only registers metadata.
     pub fn insert(&self, vma: Vma) -> Result<(), error::Error> {
-        let mut vmas = self.lock.lock_guard(&self.vmas);
-        assert_not_reentrant!(self);
+        self.validate_range(vma.start(), vma.end())?;
+        let mut state = self.state.irqsave_lock();
+        let vmas = &mut state.vmas;
         let (start, end) = (vma.start(), vma.end());
-        if Self::overlaps(&vmas, start, end) {
-            Err(error::code::EEXIST)
-        } else {
-            vmas.insert(start, vma);
-            Ok(())
+        if Self::overlaps(vmas, start, end) {
+            return Err(error::code::EEXIST);
         }
+        vmas.insert(start, vma);
+        Ok(())
     }
 
     /// Reserve a `[start, end)` VA range with `flags` at the caller-chosen
     /// address. Returns a snapshot of the inserted [`Vma`].
+    /// This only registers metadata; byte-granular intervals and addresses
+    /// below [`Self::mmap_min`] are allowed.
+    ///
     /// # Errors
-    /// - [`EINVAL`] — `start >= end` (empty/inverted range).
-    /// - [`EEXIST`] — the range overlaps an existing VMA.
-    pub fn reserve(&self, start: usize, end: usize, flags: MmapFlags) -> Result<Vma, error::Error> {
+    /// - [`error::code::EINVAL`] — empty, inverted or outside the user range.
+    /// - [`error::code::EEXIST`] — the range overlaps an existing VMA.
+    pub fn reserve(&self, start: usize, end: usize, flags: MemFlags) -> Result<Vma, error::Error> {
         let vma = Vma::new(start, end, flags)?;
-        let mut vmas = self.lock.lock_guard(&self.vmas);
-        assert_not_reentrant!(self);
-        if Self::overlaps(&vmas, start, end) {
-            Err(error::code::EEXIST)
-        } else {
-            vmas.insert(start, vma);
-            Ok(vma)
-        }
+        self.insert(vma)?;
+        Ok(vma)
     }
 
     /// Remove and return a snapshot of the VMA whose start address equals
-    /// `start`, if any.
+    /// `start`, if any. A managed user-stack or guard VMA remains reserved and
+    /// returns `None`.
     pub fn remove(&self, start: usize) -> Option<Vma> {
-        let mut vmas = self.lock.lock_guard(&self.vmas);
-        assert_not_reentrant!(self);
-        vmas.remove(&start)
+        let mut state = self.state.irqsave_lock();
+        if state.manages_vma(start) {
+            return None;
+        }
+        state.vmas.remove(&start)
     }
 
     /// Grow the VMA at `start` so its `end` becomes `new_end` (`> start`).
+    /// The key (`start`) is unchanged, so the node is **not** re-keyed. The
+    /// grown range must not overlap the next VMA.
     ///
     /// # Errors
-    /// - [`ENOENT`] — no VMA at `start`.
-    /// - [`EINVAL`] — `new_end <= start`, or the grown range
-    ///   would overlap the next VMA.
+    /// - [`error::code::ENOENT`] — no VMA at `start`.
+    /// - [`error::code::EINVAL`] — `new_end <= start`, outside the user range,
+    ///   or the grown range would overlap the next VMA.
+    /// - [`error::code::EBUSY`] — the target is a managed user stack or guard.
     pub fn extend_up(&self, start: usize, new_end: usize) -> Result<(), error::Error> {
-        let mut vmas = self.lock.lock_guard(&self.vmas);
-        assert_not_reentrant!(self);
-        if let Some((next_start, _)) = vmas.range(start + 1..).next() {
+        use core::ops::Bound::{Excluded, Unbounded};
+
+        let mut state = self.state.irqsave_lock();
+        let current = state.vmas.get(&start).copied().ok_or(error::code::ENOENT)?;
+        if state.manages_vma(start) {
+            return Err(error::code::EBUSY);
+        }
+        self.validate_range(current.start(), new_end)?;
+        let vmas = &mut state.vmas;
+        // Reject overlap with the immediately-following VMA: its start must be
+        // >= new_end. The next node's start is the BTreeMap key (free).
+        if let Some((next_start, _)) = vmas.range((Excluded(start), Unbounded)).next() {
             if *next_start < new_end {
                 return Err(error::code::EINVAL);
             }
         }
-        let vma = vmas.get_mut(&start).ok_or(error::code::ENOENT)?;
-        vma.set_end(new_end)?;
+        vmas.get_mut(&start).unwrap().set_end(new_end)?;
         Ok(())
     }
 
     /// Merge the VMA at `left_start` with the immediately-following VMA.
     ///
     /// # Errors
-    /// - [`ENOENT`] — no VMA at `left_start`, or no adjacent
+    /// - [`error::code::ENOENT`] — no VMA at `left_start`, or no adjacent
     ///   right VMA.
-    /// - [`EINVAL`] — flag mismatch.
+    /// - [`error::code::EINVAL`] — flag mismatch.
+    /// - [`error::code::EBUSY`] — an operand is a managed user stack or guard.
     pub fn merge_with_next(&self, left_start: usize) -> Result<(), error::Error> {
-        let mut vmas = self.lock.lock_guard(&self.vmas);
-        assert_not_reentrant!(self);
-        let (left_end, left_flags) = {
-            let left = vmas.get(&left_start).ok_or(error::code::ENOENT)?;
-            (left.end(), left.flags())
-        };
-        let right = vmas
-            .get(&left_end)
-            .filter(|r| r.start() == left_end)
+        let mut state = self.state.irqsave_lock();
+        let left = state
+            .vmas
+            .get(&left_start)
+            .copied()
             .ok_or(error::code::ENOENT)?;
-        let right_end = right.end();
+        if state.manages_vma(left_start) {
+            return Err(error::code::EBUSY);
+        }
+
+        let right_start = left.end();
+        let left_flags = left.flags();
+
+        let right = state
+            .vmas
+            .get(&right_start)
+            .copied()
+            .filter(|r| r.start() == right_start)
+            .ok_or(error::code::ENOENT)?;
+        if state.manages_vma(right_start) {
+            return Err(error::code::EBUSY);
+        }
         if right.flags() != left_flags {
             return Err(error::code::EINVAL);
         }
 
-        vmas.remove(&left_end).unwrap();
-        vmas.get_mut(&left_start).unwrap().set_end(right_end)?;
+        let vmas = &mut state.vmas;
+        let new_end = vmas.remove(&right_start).unwrap().end();
+        vmas.get_mut(&left_start).unwrap().set_end(new_end)?;
         Ok(())
     }
 
     /// Split the VMA at `start` into two: `[start, addr)` and `[addr, old_end)`.
     ///
     /// # Errors
-    /// - [`ENOENT`] — no VMA at `start`.
-    /// - [`EINVAL`] — `addr` is not strictly interior (`<= start` or `>= old_end`).
+    /// - [`error::code::ENOENT`] — no VMA at `start`.
+    /// - [`error::code::EINVAL`] — `addr` is not strictly interior
+    ///   (`<= start` or `>= old_end`).
+    /// - [`error::code::EBUSY`] — the target is a managed user stack or guard.
     pub fn split_at(&self, start: usize, addr: usize) -> Result<(), error::Error> {
-        let mut vmas = self.lock.lock_guard(&self.vmas);
-        assert_not_reentrant!(self);
-        // Validate everything first; only then mutate, so any failure leaves
-        // the tree untouched.
-        let (old_end, flags) = {
-            let vma = vmas.get(&start).ok_or(error::code::ENOENT)?;
-            (vma.end(), vma.flags())
-        };
-        if addr <= start || addr >= old_end {
+        let mut state = self.state.irqsave_lock();
+        let current = state.vmas.get(&start).copied().ok_or(error::code::ENOENT)?;
+        if state.manages_vma(start) {
+            return Err(error::code::EBUSY);
+        }
+        let vmas = &mut state.vmas;
+        let (old_end, flags) = (current.end(), current.flags());
+        if addr >= old_end {
             return Err(error::code::EINVAL);
         }
-        let right = Vma::new(addr, old_end, flags)?;
-
-        vmas.insert(addr, right);
         vmas.get_mut(&start).unwrap().set_end(addr)?;
+        let right = Vma::new(addr, old_end, flags)?;
+        vmas.insert(addr, right);
         Ok(())
     }
 
     /// Return a snapshot of the [`Vma`] covering `addr`, if any.
     pub fn find_containing(&self, addr: usize) -> Option<Vma> {
-        let vmas = self.lock.lock_guard(&self.vmas);
+        let state = self.state.irqsave_lock();
+        let vmas = &state.vmas;
         vmas.range(..=addr)
             .next_back()
             .map(|(_, vma)| *vma)
@@ -281,22 +419,25 @@ impl AddressSpace {
     }
 
     /// Invoke `f` for every VMA in ascending start-address order.
-    pub fn for_each<F: FnMut(Vma)>(&self, mut f: F) {
-        let vmas = self.lock.lock_guard(&self.vmas);
-        assert_not_reentrant!(self);
+    ///
+    /// The tree lock is held for the duration of the call, so `f` must not
+    /// re-enter this `AddressSpace`. Each `&Vma` is borrowed straight from
+    /// the tree guard and is invalidated once the closure returns — `f` must
+    /// not retain the reference.
+    pub fn for_each<F: FnMut(&Vma)>(&self, mut f: F) {
+        let state = self.state.irqsave_lock();
+        let vmas = &state.vmas;
         for vma in vmas.values() {
-            f(*vma);
+            f(vma);
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        let vmas = self.lock.lock_guard(&self.vmas);
-        vmas.is_empty()
+        self.state.irqsave_lock().vmas.is_empty()
     }
 
     pub fn count(&self) -> usize {
-        let vmas = self.lock.lock_guard(&self.vmas);
-        vmas.len()
+        self.state.irqsave_lock().vmas.len()
     }
 
     /// `true` if a `[start, end)` range would overlap any existing VMA.
@@ -314,18 +455,17 @@ impl AddressSpace {
     }
 }
 
-impl Default for AddressSpace {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl core::fmt::Debug for AddressSpace {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let count = self.count();
-        f.debug_struct("AddressSpace")
+        let mut debug = f.debug_struct("AddressSpace");
+        debug
             .field("vma_count", &count)
-            .finish()
+            .field("mmap_min", &self.mmap_min)
+            .field("user_end", &self.user_end());
+        #[cfg(paging)]
+        debug.field("root_address", &self.root_address());
+        debug.finish()
     }
 }
 
@@ -337,33 +477,33 @@ mod tests {
     /// Build a VMA spanning `[start, end)`. Addresses are arbitrary — no
     /// alignment is imposed — so call sites pass the `end` explicitly rather
     /// than a page count.
-    fn vma(start: usize, end: usize, flags: MmapFlags) -> Vma {
+    fn vma(start: usize, end: usize, flags: MemFlags) -> Vma {
         Vma::new(start, end, flags).unwrap()
     }
 
     #[test]
     fn vma_basic() {
-        let v = Vma::new(0x1000, 0x3000, MmapFlags::READ | MmapFlags::WRITE).unwrap();
+        let v = Vma::new(0x1000, 0x3000, MemFlags::READ | MemFlags::WRITE).unwrap();
         assert_eq!(v.start(), 0x1000);
         assert_eq!(v.end(), 0x3000);
         assert_eq!(v.len(), 0x2000);
-        assert!(v.flags().contains(MmapFlags::READ));
-        assert!(v.flags().contains(MmapFlags::WRITE));
-        assert!(!v.flags().contains(MmapFlags::EXECUTE));
+        assert!(v.flags().contains(MemFlags::READ));
+        assert!(v.flags().contains(MemFlags::WRITE));
+        assert!(!v.flags().contains(MemFlags::EXECUTE));
         assert!(v.contains(0x1000));
         assert!(v.contains(0x2fff));
         assert!(!v.contains(0x3000));
 
         // Empty range.
-        assert!(Vma::new(0x1000, 0x1000, MmapFlags::READ).is_err());
+        assert!(Vma::new(0x1000, 0x1000, MemFlags::READ).is_err());
         // Inverted range.
-        assert!(Vma::new(0x3000, 0x1000, MmapFlags::READ).is_err());
+        assert!(Vma::new(0x3000, 0x1000, MemFlags::READ).is_err());
         // Non-page-aligned ranges are now legal (the invariant was removed).
-        assert!(Vma::new(0x1, 0x3, MmapFlags::READ).is_ok());
-        assert!(Vma::new(0x1000, 0x1001, MmapFlags::READ).is_ok());
+        assert!(Vma::new(0x1, 0x3, MemFlags::READ).is_ok());
+        assert!(Vma::new(0x1000, 0x1001, MemFlags::READ).is_ok());
 
         // Mutators. `set_end`/`set_start`/`set_flags` validate ordering only.
-        let mut v = Vma::new(0x1000, 0x3000, MmapFlags::READ).unwrap();
+        let mut v = Vma::new(0x1000, 0x3000, MemFlags::READ).unwrap();
         assert!(v.set_end(0x4000).is_ok());
         assert_eq!(v.end(), 0x4000);
         // Shrinking below `start` or to `start` is rejected.
@@ -378,27 +518,158 @@ mod tests {
         // Non-page-aligned `start` is now accepted.
         assert!(v.set_start(0x2001).is_ok());
         assert_eq!(v.start(), 0x2001);
-        v.set_flags(MmapFlags::WRITE);
-        assert!(v.flags().contains(MmapFlags::WRITE));
+        v.set_flags(MemFlags::WRITE);
+        assert!(v.flags().contains(MemFlags::WRITE));
     }
 
     #[test]
     fn address_space_starts_empty() {
-        let aspace = AddressSpace::new();
+        let aspace = AddressSpace::new().unwrap();
         assert!(aspace.is_empty());
         assert_eq!(aspace.count(), 0);
+        assert_eq!(aspace.mmap_min(), MMAP_MIN_DEFAULT);
+        #[cfg(paging)]
+        assert_eq!(aspace.user_end(), 1usize << PageEntry::VIRT_ADDR_BITS);
+        #[cfg(not(paging))]
+        assert_eq!(aspace.user_end(), usize::MAX);
+        assert!(aspace.find_containing(0).is_none());
         assert!(aspace.find_containing(0x1000).is_none());
+    }
+
+    #[cfg(paging)]
+    #[test]
+    fn address_space_roots_are_private_and_empty() {
+        use crate::mm::{kernel_phys_to_virt, kernel_space::KernelAddressSpace};
+        use aarch64_cpu::registers::{TTBR0_EL1, TTBR1_EL1};
+        use tock_registers::interfaces::Readable;
+
+        let before = (TTBR0_EL1.get(), TTBR1_EL1.get());
+        let first = AddressSpace::new().unwrap();
+        let second = AddressSpace::new().unwrap();
+        assert_ne!(first.root_address(), second.root_address());
+        let kernel_root = KernelAddressSpace::get().unwrap().root_address();
+        for space in [&first, &second] {
+            let root = space.root_address();
+            assert_ne!(root, kernel_root);
+            assert_eq!(root.into_raw() % PageEntry::PAGE_SIZE, 0);
+            let ptr = kernel_phys_to_virt(root).into_raw() as *const u8;
+            // SAFETY: this space owns a live, inactive root accessible via the
+            // kernel direct map. No operation in this test changes the table.
+            let bytes = unsafe { core::slice::from_raw_parts(ptr, PageEntry::PAGE_SIZE) };
+            assert!(bytes.iter().all(|byte| *byte == 0));
+        }
+        assert_eq!((TTBR0_EL1.get(), TTBR1_EL1.get()), before);
+    }
+
+    #[cfg(paging)]
+    #[test]
+    fn address_space_creation_reports_missing_root_frame() {
+        static EMPTY: FirstFitFrameAllocator = FirstFitFrameAllocator::new();
+        assert_eq!(
+            AddressSpace::new_with_allocator(&EMPTY).unwrap_err(),
+            error::code::ENOMEM,
+        );
+        assert!(EMPTY.usage().is_none());
+    }
+
+    #[test]
+    fn address_space_explicit_low_addresses_ignore_mmap_min() {
+        let space = AddressSpace::new().unwrap();
+        assert!(space.mmap_min() > 2);
+        let flags = MemFlags::READ | MemFlags::GLOBAL;
+        let first = space.reserve(0, 1, flags).unwrap();
+        space
+            .insert(Vma::new(1, 2, MemFlags::WRITE).unwrap())
+            .unwrap();
+        assert_eq!(first.flags(), flags);
+        assert_eq!(space.find_containing(0), Some(first));
+        assert_eq!(space.count(), 2);
+    }
+
+    #[test]
+    fn address_space_upper_bound_is_exclusive() {
+        let space = AddressSpace::new().unwrap();
+        let end = space.user_end();
+        let last = space.reserve(end - 1, end, MemFlags::READ).unwrap();
+        assert_eq!(space.find_containing(end - 1), Some(last));
+        assert!(space.find_containing(end).is_none());
+        assert!(space.remove(end).is_none());
+        assert_eq!(
+            space.reserve(end, end.saturating_add(1), MemFlags::READ),
+            Err(error::code::EINVAL),
+        );
+        #[cfg(paging)]
+        {
+            assert_eq!(
+                space.reserve(end - 1, end + 1, MemFlags::READ),
+                Err(error::code::EINVAL),
+            );
+            assert_eq!(space.extend_up(end - 1, end + 1), Err(error::code::EINVAL));
+        }
+        assert_eq!(space.count(), 1);
+        assert_eq!(space.find_containing(end - 1), Some(last));
+    }
+
+    #[test]
+    fn address_space_missing_extreme_keys_do_not_overflow() {
+        let space = AddressSpace::new().unwrap();
+        assert_eq!(space.extend_up(usize::MAX, 0), Err(error::code::ENOENT));
+        assert_eq!(space.merge_with_next(usize::MAX), Err(error::code::ENOENT));
+        assert_eq!(space.split_at(usize::MAX, 0), Err(error::code::ENOENT));
+        assert!(space.find_containing(usize::MAX).is_none());
+        assert!(space.remove(usize::MAX).is_none());
+        assert_eq!(
+            space.reserve(usize::MAX, 0, MemFlags::READ),
+            Err(error::code::EINVAL)
+        );
+        assert!(space.is_empty());
+    }
+
+    #[cfg(paging)]
+    #[test]
+    fn address_space_rejects_kernel_intervals_without_restricting_vma() {
+        let space = AddressSpace::new().unwrap();
+        let existing = space.reserve(0x1000, 0x2000, MemFlags::READ).unwrap();
+        let start = crate::mm::KERNEL_VIRT_OFFSET;
+        let kernel_vma = Vma::new(start, start + 1, MemFlags::READ).unwrap();
+        assert_eq!(space.insert(kernel_vma), Err(error::code::EINVAL));
+        assert_eq!(
+            space.reserve(start, start + 1, MemFlags::READ),
+            Err(error::code::EINVAL)
+        );
+        let end = space.user_end();
+        assert_eq!(
+            space.insert(Vma::new(end - 1, end + 1, MemFlags::READ).unwrap()),
+            Err(error::code::EINVAL),
+        );
+        assert_eq!(space.count(), 1);
+        assert_eq!(space.find_containing(0x1000), Some(existing));
+    }
+
+    #[test]
+    fn address_space_split_merge_preserves_boundary_and_flags() {
+        let space = AddressSpace::new().unwrap();
+        let end = space.user_end();
+        let flags = MemFlags::WRITE | MemFlags::GLOBAL;
+        let original = space.reserve(end - 3, end, flags).unwrap();
+        space.split_at(end - 3, end - 2).unwrap();
+        assert_eq!(space.count(), 2);
+        assert_eq!(space.find_containing(end - 3).unwrap().flags(), flags);
+        assert_eq!(space.find_containing(end - 1).unwrap().flags(), flags);
+        space.merge_with_next(end - 3).unwrap();
+        assert_eq!(space.count(), 1);
+        assert_eq!(space.find_containing(end - 1), Some(original));
     }
 
     #[test]
     fn address_space_insert_find() {
-        let aspace = AddressSpace::new();
-        aspace.insert(vma(0x0000, 0x2000, MmapFlags::READ)).unwrap();
+        let aspace = AddressSpace::new().unwrap();
+        aspace.insert(vma(0x0000, 0x2000, MemFlags::READ)).unwrap();
         aspace
-            .insert(vma(0x5000, 0x6000, MmapFlags::READ | MmapFlags::WRITE))
+            .insert(vma(0x5000, 0x6000, MemFlags::READ | MemFlags::WRITE))
             .unwrap();
         aspace
-            .insert(vma(0x9000, 0xc000, MmapFlags::READ | MmapFlags::EXECUTE))
+            .insert(vma(0x9000, 0xc000, MemFlags::READ | MemFlags::EXECUTE))
             .unwrap();
         assert_eq!(aspace.count(), 3);
 
@@ -415,25 +686,23 @@ mod tests {
 
     #[test]
     fn address_space_rejects_overlap() {
-        let aspace = AddressSpace::new();
+        let aspace = AddressSpace::new().unwrap();
         aspace
-            .insert(vma(0x10000, 0x14000, MmapFlags::READ))
+            .insert(vma(0x10000, 0x14000, MemFlags::READ))
             .unwrap();
 
         // Shares a start -> overlap -> EEXIST.
-        let dup = vma(0x10000, 0x11000, MmapFlags::READ);
+        let dup = vma(0x10000, 0x11000, MemFlags::READ);
         assert_eq!(aspace.insert(dup), Err(error::code::EEXIST));
         // Begins inside the existing VMA -> overlap.
         assert!(aspace
-            .insert(vma(0x11000, 0x12000, MmapFlags::READ))
+            .insert(vma(0x11000, 0x12000, MemFlags::READ))
             .is_err());
         // Begins before and extends into the existing VMA -> overlap.
-        assert!(aspace
-            .insert(vma(0xf000, 0x13000, MmapFlags::READ))
-            .is_err());
+        assert!(aspace.insert(vma(0xf000, 0x13000, MemFlags::READ)).is_err());
         // Adjacent (not overlapping) is fine.
         aspace
-            .insert(vma(0x14000, 0x15000, MmapFlags::READ))
+            .insert(vma(0x14000, 0x15000, MemFlags::READ))
             .unwrap();
 
         assert_eq!(aspace.count(), 2);
@@ -441,12 +710,12 @@ mod tests {
 
     #[test]
     fn address_space_remove() {
-        let aspace = AddressSpace::new();
+        let aspace = AddressSpace::new().unwrap();
         aspace
-            .insert(vma(0x20000, 0x28000, MmapFlags::READ))
+            .insert(vma(0x20000, 0x28000, MemFlags::READ))
             .unwrap();
         aspace
-            .insert(vma(0x28000, 0x30000, MmapFlags::WRITE))
+            .insert(vma(0x28000, 0x30000, MemFlags::WRITE))
             .unwrap();
 
         let removed = aspace.remove(0x20000);
@@ -462,74 +731,34 @@ mod tests {
 
     #[test]
     fn address_space_for_each() {
-        let aspace = AddressSpace::new();
+        let aspace = AddressSpace::new().unwrap();
         aspace
-            .insert(vma(0x30000, 0x31000, MmapFlags::READ))
+            .insert(vma(0x30000, 0x31000, MemFlags::READ))
             .unwrap();
         aspace
-            .insert(vma(0x10000, 0x11000, MmapFlags::READ))
+            .insert(vma(0x10000, 0x11000, MemFlags::READ))
             .unwrap();
         aspace
-            .insert(vma(0x20000, 0x21000, MmapFlags::READ))
+            .insert(vma(0x20000, 0x21000, MemFlags::READ))
             .unwrap();
 
         let mut starts = alloc::vec::Vec::new();
         aspace.for_each(|v| starts.push(v.start()));
         assert_eq!(starts, alloc::vec![0x10000, 0x20000, 0x30000]);
-
-        // Snapshots are owned: retaining them past the closure is legal.
-        let mut ends = alloc::vec::Vec::new();
-        let mut retained = alloc::vec::Vec::new();
-        aspace.for_each(|v| {
-            ends.push(v.end());
-            retained.push(v);
-        });
-        assert_eq!(ends, alloc::vec![0x11000, 0x21000, 0x31000]);
-        assert_eq!(retained.len(), 3);
-    }
-
-    #[test]
-    fn address_space_for_each_reentrancy_detected_by_nesting() {
-        let aspace = AddressSpace::new();
-        aspace.insert(vma(0x1000, 0x2000, MmapFlags::READ)).unwrap();
-        // Outside any lock: nesting_count is 0, not recursively held.
-        assert_eq!(aspace.lock.count(), 0);
-        assert!(!aspace.lock.is_recursively_held());
-        // Inside `for_each` the lock is held at depth 1. The closure reads
-        // the live nesting count via the mutex's own spinlock — this does
-        // *not* call `lock_guard` on the tree mutex, so it neither recurses
-        // the tree lock nor trips `assert_not_reentrant!`. It verifies the
-        // observable precondition a re-entrant method's assert would check:
-        // depth is exactly 1 while iterating (not > 1, because `for_each`
-        // itself does not recurse).
-        aspace.for_each(|_| {
-            assert_eq!(aspace.lock.count(), 1);
-            assert!(!aspace.lock.is_recursively_held());
-        });
-        // Lock released on `for_each` exit; the space is usable afterwards.
-        assert_eq!(aspace.lock.count(), 0);
-        aspace.remove(0x1000);
-        assert!(aspace.is_empty());
-    }
-
-    #[test]
-    fn address_space_is_send_sync() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<AddressSpace>();
     }
 
     #[test]
     fn address_space_reserve_basic() {
-        let aspace = AddressSpace::new();
+        let aspace = AddressSpace::new().unwrap();
         let v = aspace
-            .reserve(0x1000, 0x3000, MmapFlags::READ | MmapFlags::WRITE)
+            .reserve(0x1000, 0x3000, MemFlags::READ | MemFlags::WRITE)
             .unwrap();
         let (vs, ve, vf) = (v.start(), v.end(), v.flags());
         assert_eq!(vs, 0x1000);
         assert_eq!(ve, 0x3000);
-        assert!(vf.contains(MmapFlags::READ));
-        assert!(vf.contains(MmapFlags::WRITE));
-        assert!(!vf.contains(MmapFlags::EXECUTE));
+        assert!(vf.contains(MemFlags::READ));
+        assert!(vf.contains(MemFlags::WRITE));
+        assert!(!vf.contains(MemFlags::EXECUTE));
         assert_eq!(aspace.count(), 1);
         // The reserved range is findable as a VMA.
         assert_eq!(aspace.find_containing(vs).unwrap().start(), vs);
@@ -537,12 +766,12 @@ mod tests {
 
     #[test]
     fn address_space_reserve_fits_between() {
-        let aspace = AddressSpace::new();
+        let aspace = AddressSpace::new().unwrap();
         // Two occupying VMAs; a free gap sits between them.
-        aspace.insert(vma(0x1000, 0x2000, MmapFlags::READ)).unwrap();
-        aspace.insert(vma(0x3000, 0x4000, MmapFlags::READ)).unwrap();
+        aspace.insert(vma(0x1000, 0x2000, MemFlags::READ)).unwrap();
+        aspace.insert(vma(0x3000, 0x4000, MemFlags::READ)).unwrap();
         // Reserve exactly the gap [0x2000, 0x3000).
-        let v = aspace.reserve(0x2000, 0x3000, MmapFlags::READ).unwrap();
+        let v = aspace.reserve(0x2000, 0x3000, MemFlags::READ).unwrap();
         let (vs, ve, _) = (v.start(), v.end(), v.flags());
         assert_eq!(vs, 0x2000);
         assert_eq!(ve, 0x3000);
@@ -555,15 +784,15 @@ mod tests {
 
     #[test]
     fn address_space_reserve_rejects_empty_range() {
-        let aspace = AddressSpace::new();
+        let aspace = AddressSpace::new().unwrap();
         // `start >= end` is rejected by `Vma::new` as EINVAL.
         assert_eq!(
-            aspace.reserve(0x1000, 0x1000, MmapFlags::READ).err(),
+            aspace.reserve(0x1000, 0x1000, MemFlags::READ).err(),
             Some(error::code::EINVAL)
         );
         // Inverted range likewise.
         assert_eq!(
-            aspace.reserve(0x3000, 0x1000, MmapFlags::READ).err(),
+            aspace.reserve(0x3000, 0x1000, MemFlags::READ).err(),
             Some(error::code::EINVAL)
         );
         assert!(aspace.is_empty());
@@ -571,11 +800,11 @@ mod tests {
 
     #[test]
     fn address_space_reserve_rejects_overlap() {
-        let aspace = AddressSpace::new();
-        aspace.reserve(0x1000, 0x2000, MmapFlags::READ).unwrap();
+        let aspace = AddressSpace::new().unwrap();
+        aspace.reserve(0x1000, 0x2000, MemFlags::READ).unwrap();
         // Overlapping range → EEXIST.
         assert_eq!(
-            aspace.reserve(0x1500, 0x2500, MmapFlags::READ).err(),
+            aspace.reserve(0x1500, 0x2500, MemFlags::READ).err(),
             Some(error::code::EEXIST)
         );
         assert_eq!(aspace.count(), 1);
@@ -583,8 +812,8 @@ mod tests {
 
     #[test]
     fn address_space_reserve_then_remove() {
-        let aspace = AddressSpace::new();
-        let v = aspace.reserve(0x1000, 0x2000, MmapFlags::READ).unwrap();
+        let aspace = AddressSpace::new().unwrap();
+        let v = aspace.reserve(0x1000, 0x2000, MemFlags::READ).unwrap();
         let first_start = v.start();
         assert_eq!(aspace.count(), 1);
 
@@ -592,16 +821,16 @@ mod tests {
         assert!(aspace.is_empty());
 
         // Re-reserve the same range → succeeds at the same address.
-        let v2 = aspace.reserve(0x1000, 0x2000, MmapFlags::READ).unwrap();
+        let v2 = aspace.reserve(0x1000, 0x2000, MemFlags::READ).unwrap();
         assert_eq!(v2.start(), first_start);
         assert_eq!(aspace.count(), 1);
     }
 
     #[test]
     fn address_space_extend_up_grows_unbacked() {
-        let aspace = AddressSpace::new();
+        let aspace = AddressSpace::new().unwrap();
         let v = aspace
-            .reserve(0x1000, 0x2000, MmapFlags::READ | MmapFlags::WRITE)
+            .reserve(0x1000, 0x2000, MemFlags::READ | MemFlags::WRITE)
             .unwrap();
         let (vs, ve, _) = (v.start(), v.end(), v.flags());
         // Grow; key (start) unchanged, count unchanged.
@@ -620,11 +849,11 @@ mod tests {
 
     #[test]
     fn address_space_extend_up_rejects_overlap() {
-        let aspace = AddressSpace::new();
-        let a = aspace.reserve(0x1000, 0x2000, MmapFlags::READ).unwrap();
+        let aspace = AddressSpace::new().unwrap();
+        let a = aspace.reserve(0x1000, 0x2000, MemFlags::READ).unwrap();
         let (as_, ae, _) = (a.start(), a.end(), a.flags());
         // Place a second VMA right after `a`.
-        let b = aspace.reserve(0x2000, 0x3000, MmapFlags::READ).unwrap();
+        let b = aspace.reserve(0x2000, 0x3000, MemFlags::READ).unwrap();
         let (bs, _, _) = (b.start(), b.end(), b.flags());
         assert_eq!(bs, ae); // adjacent
                             // Extending `a` into `b` must fail.
@@ -637,11 +866,11 @@ mod tests {
 
     #[test]
     fn address_space_merge_with_next_same_flags() {
-        let aspace = AddressSpace::new();
+        let aspace = AddressSpace::new().unwrap();
         // Two adjacent same-flag VMAs.
-        let a = aspace.reserve(0x1000, 0x2000, MmapFlags::READ).unwrap();
+        let a = aspace.reserve(0x1000, 0x2000, MemFlags::READ).unwrap();
         let (as_, ae, _) = (a.start(), a.end(), a.flags());
-        let b = aspace.reserve(0x2000, 0x3000, MmapFlags::READ).unwrap();
+        let b = aspace.reserve(0x2000, 0x3000, MemFlags::READ).unwrap();
         let (bs, be, _) = (b.start(), b.end(), b.flags());
         assert_eq!(bs, ae); // adjacency
         assert_eq!(aspace.count(), 2);
@@ -659,10 +888,10 @@ mod tests {
 
     #[test]
     fn address_space_merge_with_next_rejects_flag_mismatch() {
-        let aspace = AddressSpace::new();
-        let a = aspace.reserve(0x1000, 0x2000, MmapFlags::READ).unwrap();
+        let aspace = AddressSpace::new().unwrap();
+        let a = aspace.reserve(0x1000, 0x2000, MemFlags::READ).unwrap();
         let (as_, _, _) = (a.start(), a.end(), a.flags());
-        let b = aspace.reserve(0x2000, 0x3000, MmapFlags::WRITE).unwrap();
+        let b = aspace.reserve(0x2000, 0x3000, MemFlags::WRITE).unwrap();
         let (bs, _, _) = (b.start(), b.end(), b.flags());
         assert_eq!(aspace.merge_with_next(as_), Err(error::code::EINVAL));
         // Both VMAs intact on failure.
@@ -674,13 +903,13 @@ mod tests {
 
     #[test]
     fn address_space_merge_with_next_rejects_gap() {
-        let aspace = AddressSpace::new();
+        let aspace = AddressSpace::new().unwrap();
         // Two VMAs with a gap between them.
         aspace
-            .insert(vma(0x10000, 0x11000, MmapFlags::READ))
+            .insert(vma(0x10000, 0x11000, MemFlags::READ))
             .unwrap();
         aspace
-            .insert(vma(0x20000, 0x21000, MmapFlags::READ))
+            .insert(vma(0x20000, 0x21000, MemFlags::READ))
             .unwrap();
         // 0x11000 != 0x20000 → not adjacent.
         assert_eq!(aspace.merge_with_next(0x10000), Err(error::code::ENOENT));
@@ -691,8 +920,8 @@ mod tests {
 
     #[test]
     fn address_space_split_at_interior() {
-        let aspace = AddressSpace::new();
-        let v = aspace.reserve(0x1000, 0x5000, MmapFlags::READ).unwrap();
+        let aspace = AddressSpace::new().unwrap();
+        let v = aspace.reserve(0x1000, 0x5000, MemFlags::READ).unwrap();
         let (vs, ve, vf) = (v.start(), v.end(), v.flags());
         let split = vs + 0x2000;
         aspace.split_at(vs, split).unwrap();
@@ -714,8 +943,8 @@ mod tests {
 
     #[test]
     fn address_space_split_at_rejects_boundary() {
-        let aspace = AddressSpace::new();
-        let v = aspace.reserve(0x1000, 0x3000, MmapFlags::READ).unwrap();
+        let aspace = AddressSpace::new().unwrap();
+        let v = aspace.reserve(0x1000, 0x3000, MemFlags::READ).unwrap();
         let (vs, ve, _) = (v.start(), v.end(), v.flags());
         // `addr == start` or `addr == end` are not interior.
         assert_eq!(aspace.split_at(vs, vs), Err(error::code::EINVAL));
