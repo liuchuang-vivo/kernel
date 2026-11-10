@@ -15,7 +15,9 @@
 pub(crate) mod irq;
 mod trap;
 
-use crate::{boards, irq as sysirq, scheduler, scheduler::ContextSwitchHookHolder};
+use crate::{
+    boards, irq as sysirq, mm::PhysicalAddress, scheduler, scheduler::ContextSwitchHookHolder,
+};
 use core::{
     cell::Cell,
     mem::offset_of,
@@ -540,6 +542,19 @@ pub(crate) extern "C" fn current_cpu_id() -> usize {
     };
     id
 }
+
+/// Cross-arch `arch::switch_user_address_space` stub. RISC-V currently runs
+/// M-mode only (no S-mode trap, no `satp`), so there are no user address
+/// spaces to switch. The function exists for ABI uniformity so the scheduler
+/// needs no `#[cfg(target_arch = "...")]`; it is a no-op and both args are
+/// always `None` until S-mode/U-mode support lands.
+#[inline]
+pub(crate) fn switch_user_address_space(
+    _prev: Option<PhysicalAddress>,
+    _next: Option<PhysicalAddress>,
+) {
+}
+
 #[unsafe(naked)]
 pub(crate) extern "C" fn switch_stack(
     to_sp: usize,

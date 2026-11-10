@@ -16,6 +16,7 @@ extern crate alloc;
 use crate::{
     allocator,
     arch::{self, Context},
+    mm::PhysicalAddress,
     signal,
     support::DisableInterruptGuard,
     sync::SpinLockGuard,
@@ -191,6 +192,23 @@ pub(crate) extern "C" fn save_context_finish_hook(
     switch_current_thread(next, old_sp)
 }
 
+/// Resolve the user address-space root a thread runs under, if any.
+///
+/// A user thread runs in its owning process's address space; kernel/idle
+/// threads own none. This is the per-thread authority for what `TTBR0_EL1`
+/// should hold while the thread is running — the scheduler derives both the
+/// outgoing (`prev`) and incoming (`next`) roots from the threads themselves,
+/// so `arch::switch_user_address_space` needs no per-CPU cache of its own.
+/// The arch layer's `Some(root)`/`None` match encodes the user/kernel split.
+#[cfg(paging)]
+fn thread_as_root(t: &Thread) -> Option<PhysicalAddress> {
+    if t.kind() == thread::ThreadKind::User {
+        t.process().map(|p| p.address_space().root_address())
+    } else {
+        None
+    }
+}
+
 fn switch_current_thread(next: ThreadNode, old_sp: usize) -> usize {
     #[cfg(round_robin)]
     let now = Tick::now();
@@ -215,7 +233,27 @@ fn switch_current_thread(next: ThreadNode, old_sp: usize) -> usize {
     arch::mpu::update_thread_stack_guard(&next);
     let ok = next.transfer_state(thread::READY, thread::RUNNING);
     debug_assert_eq!(ok, Ok(()));
+    // Resolve the incoming thread's user address-space root *before*
+    // `set_current_thread` consumes `next`. User threads run in their owning
+    // process's address space; kernel/idle threads own none. This is a
+    // *feature* gate (paging), not an arch gate: without paging there are no
+    // user address spaces, so the root is always `None`. The arch-specific
+    // *action* (TTBR0/satp/...) is dispatched by `arch::switch_user_address_space`
+    // below — no `#[cfg(target_arch)]` here.
+    #[cfg(paging)]
+    let next_as_root: Option<PhysicalAddress> = thread_as_root(&next);
+    #[cfg(not(paging))]
+    let next_as_root: Option<PhysicalAddress> = None;
     let mut old = set_current_thread(next);
+    // The outgoing thread `old` is the authority for what `TTBR0_EL1` currently
+    // holds, so we derive the previous root from it the same way — no per-CPU
+    // cache to keep in sync. Passing both roots lets the arch layer skip the
+    // TTBR0/TCR/TLB write on user→same-user and kernel→kernel (both `None`).
+    #[cfg(paging)]
+    let prev_as_root: Option<PhysicalAddress> = thread_as_root(&old);
+    #[cfg(not(paging))]
+    let prev_as_root: Option<PhysicalAddress> = None;
+    arch::switch_user_address_space(prev_as_root, next_as_root);
     #[cfg(thread_stats)]
     old.increment_cycles(cycles);
     #[cfg(debugging_scheduler)]
@@ -265,6 +303,7 @@ fn cleanup_retired_thread(old: &mut ThreadNode) {
                 Entry::C(f) => f(),
                 Entry::Closure(f) => f(),
                 Entry::Posix(f, arg) => f(arg),
+                Entry::User { .. } => {}
             },
         }
     };

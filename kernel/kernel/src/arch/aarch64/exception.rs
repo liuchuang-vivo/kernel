@@ -66,6 +66,7 @@ macro_rules! exception_handler {
                 x28 = const offset_of!(Context, x28),
                 spsr = const offset_of!(Context, spsr),
                 elr = const offset_of!(Context, elr),
+                sp_el0 = const offset_of!(Context, sp_el0),
                 v0 = const offset_of!(Context, v0),
                 v2 = const offset_of!(Context, v2),
                 v4 = const offset_of!(Context, v4),

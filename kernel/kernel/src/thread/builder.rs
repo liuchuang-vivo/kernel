@@ -116,6 +116,16 @@ impl Builder {
         }
     }
 
+    /// Convenience constructor for a user thread resuming at `pc` in user
+    /// privilege with `sp` as the user stack pointer. Equivalent to
+    /// [`Builder::new`]`(`[`Entry::User`]` { pc, sp })`. The owning process's
+    /// address space must be wired onto the thread (via `set_aspace`) before
+    /// the thread is first scheduled, so the switch path can activate it.
+    #[inline]
+    pub fn user(pc: usize, sp: usize) -> Self {
+        Self::new(Entry::User { pc, sp })
+    }
+
     #[inline]
     pub fn set_priority(mut self, p: ThreadPriority) -> Self {
         self.priority = p;
@@ -129,7 +139,15 @@ impl Builder {
     }
 
     pub fn build(mut self) -> ThreadNode {
-        let thread = ThreadNode::new(Thread::new(ThreadKind::Normal));
+        // `Entry` is not `Copy`/`Clone`, so determine the kind by borrowing
+        // before the entry is moved into `init`. User threads get their own
+        // kind so the switch path knows to activate an address space.
+        let kind = if matches!(self.entry, Entry::User { .. }) {
+            ThreadKind::User
+        } else {
+            ThreadKind::Normal
+        };
+        let thread = ThreadNode::new(Thread::new(kind));
         let mut w = thread.lock();
         let stack = self
             .stack

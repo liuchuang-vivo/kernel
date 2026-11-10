@@ -58,6 +58,11 @@ pub enum Entry {
         *mut core::ffi::c_void,
     ),
     Closure(Box<dyn FnOnce()>),
+    /// First entry of a user thread: resume at `pc` in EL0/U with `sp` as the
+    /// user stack pointer. The owning process's address space is activated by
+    /// the scheduler switch path; the forged `arch::Context` carries the
+    /// privilege level. No kernel-side run wrapper is used.
+    User { pc: usize, sp: usize },
 }
 
 impl core::fmt::Debug for Entry {
@@ -82,6 +87,10 @@ pub enum ThreadKind {
     Normal,
     #[cfg(soft_timer)]
     SoftTimer,
+    /// Runs in its owning process's address space at user privilege (EL0/U).
+    /// The switch path activates the address space and the forged context
+    /// returns to user mode via the shared trap-return path.
+    User,
 }
 
 #[derive(Debug)]
@@ -435,6 +444,7 @@ impl Thread {
             ThreadKind::Normal => "normal",
             #[cfg(soft_timer)]
             ThreadKind::SoftTimer => "soft_timer",
+            ThreadKind::User => "user",
         }
     }
 
@@ -719,14 +729,26 @@ impl Thread {
         let ctx = unsafe { builder.zeroed_after_start::<arch::Context>().unwrap() };
         self.set_saved_sp(ctx as *const _ as usize);
 
-        ctx.init();
         // TODO: We should provide the thread a more rusty environment
         // to run the function safely.
         match entry {
-            Entry::C(f) => ctx
-                .set_return_address(run_simple_c as *const () as usize)
-                .set_arg(0, unsafe { f as usize }),
+            Entry::User { pc, sp } => {
+                // Forge a first-entry user context: spsr=EL0t, elr=pc,
+                // sp_el0=sp. The shared trap-return path (`eret`) drops to
+                // EL0 at `pc`; no kernel run wrapper is used. The pc/sp live
+                // only in this forged `arch::Context` frame on the kernel
+                // stack — they are the authority the switch path and trap
+                // return read (`saved_sp` as *mut Context), so the thread need
+                // not carry a separate copy.
+                ctx.init_user(pc, sp);
+            }
+            Entry::C(f) => {
+                ctx.init();
+                ctx.set_return_address(run_simple_c as *const () as usize)
+                    .set_arg(0, unsafe { f as usize });
+            }
             Entry::Closure(boxed) => {
+                ctx.init();
                 // FIXME: We need to make a new box to contain Box<dyn
                 // FnOnce() + Send + 'static>, since *mut (dyn
                 // FnOnce() + Send + 'static) is 64 bits in 32-bit
@@ -735,10 +757,12 @@ impl Thread {
                 ctx.set_return_address(run_closure as *const () as usize)
                     .set_arg(0, raw as *mut Box<dyn FnOnce()> as usize)
             }
-            Entry::Posix(f, arg) => ctx
-                .set_return_address(run_posix as *const () as usize)
-                .set_arg(0, unsafe { f as usize })
-                .set_arg(1, unsafe { arg as usize }),
+            Entry::Posix(f, arg) => {
+                ctx.init();
+                ctx.set_return_address(run_posix as *const () as usize)
+                    .set_arg(0, unsafe { f as usize })
+                    .set_arg(1, unsafe { arg as usize });
+            }
         };
         self
     }

@@ -18,6 +18,7 @@ pub(crate) mod xpsr;
 use crate::{
     arch::irq::Vector,
     boot::_start,
+    mm::PhysicalAddress,
     scheduler,
     support::{sideeffect, Region, RegionalObjectBuilder},
     syscalls::{dispatch_syscall, Context as ScContext},
@@ -680,6 +681,17 @@ pub(crate) extern "C" fn restore_context_with_hook(hook: *mut ContextSwitchHookH
 #[inline]
 pub extern "C" fn current_cpu_id() -> usize {
     0
+}
+
+/// Cross-arch `arch::switch_user_address_space` stub. ARM Cortex-M uses an MPU
+/// with no user/kernel address-space separation, so there are no user tables to
+/// switch. The function exists for ABI uniformity so the scheduler needs no
+/// `#[cfg(target_arch = "...")]`; it is a no-op and both args are always `None`.
+#[inline]
+pub(crate) fn switch_user_address_space(
+    _prev: Option<PhysicalAddress>,
+    _next: Option<PhysicalAddress>,
+) {
 }
 
 #[inline]

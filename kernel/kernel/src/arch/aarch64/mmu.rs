@@ -33,6 +33,29 @@ fn flush_tlb_all() {
     isb(SY);
 }
 
+/// Inner-shareable TLB invalidate for the whole EL1 translation regime.
+///
+/// Self-contained: `dsb ishst` makes prior page-table writes visible to the
+/// inner-shareable domain's walkers, `tlbi vmalle1is` broadcasts the
+/// invalidate, `dsb ish` waits for completion, `isb` synchronizes this CPU's
+/// subsequent translations. Unlike [`flush_tlb_all`] (non-shareable
+/// `tlbi vmalle1`), this reaches every core — required for user translations
+/// that may be cached elsewhere (SMP) or whose backing frames may be reused.
+/// See W4 for ASID-tagged shootdowns.
+#[inline]
+fn flush_tlb_all_inner_shareable() {
+    // Canonical barrier sequence, matching `sync_kernel_mappings` below.
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// Publish kernel page-table changes and retire translations on every CPU
 /// in the inner-shareable domain before backing/table frames can be reused.
 pub(crate) fn sync_kernel_mappings() {
@@ -106,4 +129,101 @@ pub unsafe fn activate_kernel_table(root: PhysicalAddress) {
     TTBR1_EL1.set(root.into_raw() as u64);
     isb(SY);
     flush_tlb_all();
+}
+
+/// Activate a user address space on this CPU by loading its root into
+/// `TTBR0_EL1` and enabling TTBR0 walks.
+///
+/// Unlike [`activate_kernel_table`], this leaves `TTBR1_EL1` (the kernel
+/// mapping) untouched — the kernel high-VA mapping stays live across the
+/// switch, so the switch path itself keeps running on `TTBR1`. Only the
+/// lower-VA half (user space) is re-pointed.
+///
+/// `asid` is currently ignored (ASID allocation arrives in W4); the inner
+/// shareable `tlbi vmalle1is` here flushes any stale user translations from
+/// the previous tenant before the new root takes effect. Callers MUST have
+/// built the user table fully (mapped PT_LOAD segments + user stack) before
+/// the first activation; the forged user `Context` then `eret`s into EL0 with
+/// `TTBR0` pointing at this root.
+///
+/// # Safety
+/// `root` must be a valid, live physical address of a page-table root built
+/// for the configured format, and must not be concurrently modified after
+/// activation. The caller must run at EL1 with the MMU on.
+pub unsafe fn activate_user_table(root: PhysicalAddress, _asid: u16) {
+    dsb(SY);
+    // Re-enable TTBR0 walks (boot disables them via activate_kernel_table /
+    // init_el1_enable_mmu sets EPD0::Enable, but kernel-thread switches
+    // deactivate them). Kernel TTBR1 walks stay enabled throughout.
+    TCR_EL1.modify(TCR_EL1::EPD0::EnableTTBR0Walks);
+    TTBR0_EL1.set(root.into_raw() as u64);
+    isb(SY);
+    // Inner-shareable: even on single-core boards the frames backing the
+    // previous user table may be reused, so translations must retire on all
+    // cores. ASID-tagged flush (tlbi asid) arrives with W4.
+    flush_tlb_all_inner_shareable();
+}
+
+/// Deactivate the user address space on this CPU when switching from a user
+/// thread to a kernel/idle thread.
+///
+/// Disables TTBR0 walks and zeroes `TTBR0_EL1` so subsequent kernel-side
+/// accesses cannot ride on stale user translations. The kernel continues to
+/// run on `TTBR1_EL1`. This is the inverse of [`activate_user_table`] for the
+/// user→kernel transition; kernel→kernel transitions do not call it.
+///
+/// # Safety
+/// Caller must run at EL1 with the MMU on. After this call, any access to a
+/// user VA faults (TTBR0 walk disabled) until a user table is reactivated.
+pub unsafe fn deactivate_user_table() {
+    dsb(SY);
+    TCR_EL1.modify(TCR_EL1::EPD0::DisableTTBR0Walks);
+    TTBR0_EL1.set(0);
+    isb(SY);
+    flush_tlb_all_inner_shareable();
+}
+
+/// Switch this CPU's user address space to the one the next thread needs.
+///
+/// `prev` is the root the outgoing (`old`) thread was running under, `next` is
+/// the root the incoming thread needs: `Some(root)` for a user thread, `None`
+/// for a kernel/idle thread. Both are resolved by the scheduler from the
+/// threads themselves (a user thread's root is its process's
+/// `address_space().root_address()`; kernel/idle threads have none) — this
+/// function holds NO cache of its own. The outgoing thread *is* the authority
+/// for what `TTBR0_EL1` currently holds, so the `prev == next` short-circuit
+/// covers both the no-op cases without any stored state:
+///
+/// | prev        | next      | action              |
+/// |-------------|-----------|---------------------|
+/// | None        | None      | nothing             | kernel→kernel
+/// | None        | Some(r)   | activate r          | kernel→user
+/// | Some(r)     | Some(r)   | nothing             | user→same-user
+/// | Some(other) | Some(r)   | activate r          | user→user (diff root)
+/// | Some(r)     | None      | deactivate          | user→kernel
+///
+/// This is the sole call site the scheduler needs: it passes both resolved
+/// roots and this function owns the comparison and the TTBR0/TCR/TLB sequence.
+/// ASID is currently 0 (W4 will thread `{root, asid}` pairs through both args).
+///
+/// Runs with local IRQs disabled (the switch path holds them off).
+pub(crate) fn switch_user_address_space(
+    prev: Option<PhysicalAddress>,
+    next: Option<PhysicalAddress>,
+) {
+    // Same root (including both None) => TTBR0 already correct; skip the write.
+    if prev == next {
+        return;
+    }
+
+    // SAFETY: the switch path runs at EL1 with the MMU on and IRQs off. `next`
+    // (when Some) is a valid, live page-table root built by the loader before
+    // the thread was enqueued. The kernel mapping (TTBR1) stays live throughout
+    // both branches.
+    unsafe {
+        match next {
+            Some(root) => activate_user_table(root, 0),
+            None => deactivate_user_table(),
+        }
+    }
 }

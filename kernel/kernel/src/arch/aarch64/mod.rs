@@ -28,6 +28,7 @@ use aarch64_cpu::{
     asm::wfi,
     registers::{Readable, Writeable, DAIF, MPIDR_EL1, SP},
 };
+use crate::mm::PhysicalAddress;
 use core::{
     fmt,
     mem::offset_of,
@@ -219,7 +220,7 @@ macro_rules! aarch64_save_context {
         mrs x8, fpcr
         str x8, [sp, #{fpcr}]
         mrs x8, fpsr
-        str x8, [sp, #{fpsr}]   
+        str x8, [sp, #{fpsr}]
         "
     };
 }
@@ -253,6 +254,15 @@ macro_rules! aarch64_restore_context {
         msr spsr_el1, x9
         ldr x8, [sp, #{elr}]
         msr elr_el1, x8
+        // Returning to EL0 (SPSR.M[3:0] == 0b0000 → bit 2 clear): install the
+        // saved sp_el0 as SP_EL0 before `eret`. EL1 returns (EL1t/EL1h, bit 2
+        // set) keep running on SP_EL1 and skip this write.
+        tbz x9, #2, 1f
+        b 2f
+1:
+        ldr x8, [sp, #{sp_el0}]
+        msr sp_el0, x8
+2:
         ldp x0, x1, [sp, #{x0}]
         ldp x2, x3, [sp, #{x2}]
         ldp x4, x5, [sp, #{x4}]
@@ -308,7 +318,7 @@ pub struct Context {
     pub lr: usize, // x30
     pub elr: usize,
     pub spsr: usize,
-    pub padding: usize,
+    pub sp_el0: usize,
     pub v0: [u64; 2],
     pub v1: [u64; 2],
     pub v2: [u64; 2],
@@ -349,6 +359,21 @@ impl Context {
     #[inline]
     pub(crate) fn init(&mut self) -> &mut Self {
         self.spsr = 0b0101;
+        self
+    }
+
+    /// Forge the first-entry context for a user thread.
+    ///
+    /// `spsr = 0b0000` selects EL0t with IRQ unmasked, so the shared
+    /// trap-return path (`aarch64_restore_context!` + `eret`) drops to EL0 at
+    /// `pc` with `sp_el0` installed as SP_EL0. Kernel threads keep using
+    /// [`Context::init`] (EL1h, SP_EL1); their `sp_el0` stays 0 and is never
+    /// written back, since the restore path only loads SP_EL0 for EL0 returns.
+    #[inline]
+    pub(crate) fn init_user(&mut self, pc: usize, sp: usize) -> &mut Self {
+        self.spsr = 0b0000;
+        self.elr = pc;
+        self.sp_el0 = sp;
         self
     }
 
@@ -552,6 +577,34 @@ pub extern "C" fn enable_local_irq() {
 #[inline]
 pub extern "C" fn current_cpu_id() -> usize {
     cpu_id_from_mpidr(MPIDR_EL1.get() as usize).expect("CPU affinity missing from board topology")
+}
+
+/// Switch this CPU's user address space from the outgoing thread's root to the
+/// incoming thread's root.
+///
+/// Cross-arch entry point: the scheduler calls `arch::switch_user_address_space`
+/// uniformly, and each architecture's top-level module provides this function
+/// via the `pub use <arch>::*` re-export in `arch/mod.rs`. On aarch64 this
+/// delegates to [`mmu::switch_user_address_space`], which owns the TTBR0/TCR/TLB
+/// sequence. `prev`/`next` are the outgoing/incoming thread's roots (`None` for
+/// a kernel/idle thread). This function holds no per-CPU cache — the scheduler
+/// derives both roots from the threads themselves.
+#[inline]
+pub(crate) fn switch_user_address_space(
+    prev: Option<PhysicalAddress>,
+    next: Option<PhysicalAddress>,
+) {
+    #[cfg(paging)]
+    {
+        mmu::switch_user_address_space(prev, next);
+    }
+    // Without paging there are no user address spaces, so both args are always
+    // `None` and there is nothing to switch. The function exists for ABI
+    // uniformity so the scheduler needs no `#[cfg]`.
+    #[cfg(not(paging))]
+    {
+        let _ = (prev, next);
+    }
 }
 
 #[inline(always)]
