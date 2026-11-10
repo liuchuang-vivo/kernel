@@ -13,6 +13,8 @@ extern crate rsrt;
 
 mod runner;
 use blueos::loader::adapters::{FlatImageAllocation, SliceElfReader};
+#[cfg(enable_vfs)]
+use blueos::{loader::adapters::VfsElfReader, vfs::FileOps};
 use runner::FileReader;
 // Import it just for the global allocator.
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
@@ -102,7 +104,15 @@ mod test_elf_loader {
     #[test]
     fn test_load_elf_in_unowned_rtos_thread() {
         let bytes = read_all(unsafe { LOADER_TEST_ELF_PATH }).unwrap();
+        run_in_unowned_thread(move || {
+            let _pinned = blueos::support::DisableInterruptGuard::new();
+            let image = blueos::loader::load_image(SliceElfReader::new(&bytes))
+                .expect("load ELF in an unowned RTOS thread");
+            run(&image);
+        });
+    }
 
+    fn run_in_unowned_thread(work: impl FnOnce() + Send + 'static) {
         let done = Arc::new(AtomicUsize::new(0));
         let loaded = Arc::new(AtomicBool::new(false));
         let done_w = done.clone();
@@ -112,14 +122,8 @@ mod test_elf_loader {
         let stack = blueos::thread::Stack::from_size(16 << 10).expect("loader test stack");
         let mut t =
             blueos::thread::Builder::new(blueos::thread::Entry::Closure(Box::new(move || {
-                {
-                    // The fixture executes synchronously on this CPU. Keep its
-                    // local cache publication and execution in one context.
-                    let _pinned = blueos::support::DisableInterruptGuard::new();
-                    let image = blueos::loader::load_image(SliceElfReader::new(&bytes))
-                        .expect("load ELF in an unowned RTOS thread");
-                    run(&image);
-                }
+                assert!(blueos::process::current_process().is_none());
+                work();
                 loaded_w.store(true, Ordering::Release);
                 // Return normally: run_closure releases this closure and its
                 // captures before retiring the thread.
@@ -140,6 +144,56 @@ mod test_elf_loader {
         blueos::sync::wait_until(1, &done);
         assert!(loaded.load(Ordering::Acquire));
         assert_eq!(Arc::strong_count(&loaded), 1);
+    }
+
+    #[cfg(enable_vfs)]
+    #[test]
+    fn test_load_elf_from_vfs_in_unowned_rtos_thread() {
+        const PATH: &str = "/loader-vfs-test.elf";
+        // Copy the host fixture into target tmpfs in small chunks. The ELF
+        // reader under test then reads the target file directly, without
+        // keeping a second complete input buffer or allocating a descriptor.
+        let mut source =
+            semihosting::fs::File::open(unsafe { CStr::from_ptr(LOADER_TEST_ELF_PATH) })
+                .expect("open host ELF fixture");
+        let file =
+            blueos::vfs::open_path(PATH, libc::O_CREAT | libc::O_TRUNC | libc::O_WRONLY, 0o600)
+                .expect("create target ELF file");
+        let len = usize::try_from(source.metadata().unwrap().len()).unwrap();
+        file.resize(len).expect("size target file before copying");
+        let mut copied = 0;
+        let mut buffer = [0; 512];
+        loop {
+            let count = source.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            let mut written = 0;
+            while written < count {
+                let size = file.write(&buffer[written..count]).unwrap();
+                assert!(size != 0);
+                written += size;
+            }
+            copied += count;
+        }
+        assert_eq!(copied, len);
+        drop(file);
+        drop(source);
+
+        run_in_unowned_thread(|| {
+            let file = blueos::vfs::open_path(PATH, libc::O_RDONLY, 0)
+                .expect("open target ELF without a process or fd");
+            let reader = VfsElfReader::new(file).expect("readable regular ELF file");
+            // This tmpfs file is resident and has no concurrent users. Keep
+            // local cache publication and fixture execution on this CPU.
+            let _pinned = blueos::support::DisableInterruptGuard::new();
+            let image = blueos::loader::load_image(reader).expect("load ELF from target VFS");
+            run(&image);
+        });
+        assert_eq!(
+            blueos::vfs::syscalls::unlink(c"/loader-vfs-test.elf".as_ptr()),
+            0
+        );
     }
 
     #[test]

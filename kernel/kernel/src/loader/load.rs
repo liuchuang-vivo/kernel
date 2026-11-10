@@ -48,6 +48,9 @@ pub fn load_request() -> LoadRequest {
 /// changing bytes. Without an authorized region, fixed placement is rejected.
 /// The returned image retains its mapping and entry/lifecycle addresses; it
 /// does not execute them.
+/// With VFS enabled, callers can pass `VfsElfReader::new(file)?` after opening
+/// a regular file through `vfs::open_path()`. This also works on direct RTOS
+/// threads without a Process or a file descriptor table.
 ///
 /// Code publication is current-execution-context only. The caller must keep
 /// the image's execution on this context until a host-wide rendezvous is used;

@@ -17,7 +17,11 @@
 pub mod code_cache;
 pub mod flat_memory;
 pub mod memory_reader;
+#[cfg(enable_vfs)]
+pub mod vfs_reader;
 
 pub use code_cache::KernelCodeCache;
 pub use flat_memory::{FlatImageAllocation, MemoryMapper, MemoryRegion};
 pub use memory_reader::SliceElfReader;
+#[cfg(enable_vfs)]
+pub use vfs_reader::VfsElfReader;
