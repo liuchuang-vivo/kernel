@@ -12,7 +12,7 @@ extern crate alloc;
 extern crate rsrt;
 
 mod runner;
-use blueos::application::adapters::{FlatImageAllocation, SliceElfReader};
+use blueos::loader::adapters::{FlatImageAllocation, SliceElfReader};
 use runner::FileReader;
 // Import it just for the global allocator.
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
@@ -90,8 +90,8 @@ mod test_elf_loader {
     fn test_load_elf_and_run() {
         let bytes = read_all(unsafe { LOADER_TEST_ELF_PATH }).unwrap();
         let _pinned = blueos::support::DisableInterruptGuard::new();
-        let image = blueos::application::load_image(SliceElfReader::new(&bytes))
-            .expect("load ELF from memory");
+        let image =
+            blueos::loader::load_image(SliceElfReader::new(&bytes)).expect("load ELF from memory");
         run(&image);
     }
 
@@ -116,7 +116,7 @@ mod test_elf_loader {
                     // The fixture executes synchronously on this CPU. Keep its
                     // local cache publication and execution in one context.
                     let _pinned = blueos::support::DisableInterruptGuard::new();
-                    let image = blueos::application::load_image(SliceElfReader::new(&bytes))
+                    let image = blueos::loader::load_image(SliceElfReader::new(&bytes))
                         .expect("load ELF in an unowned RTOS thread");
                     run(&image);
                 }
@@ -147,7 +147,7 @@ mod test_elf_loader {
         let input = open(unsafe { LOADER_TEST_ELF_PATH });
         let _pinned = blueos::support::DisableInterruptGuard::new();
         let image =
-            blueos::application::load_image(input).expect("load ELF through positional file reads");
+            blueos::loader::load_image(input).expect("load ELF through positional file reads");
         run(&image);
     }
 
@@ -160,21 +160,21 @@ mod test_elf_loader {
     fn test_invalid_entry() {
         let input = open(unsafe { INVALID_ENTRY_ELF_PATH });
         let _pinned = blueos::support::DisableInterruptGuard::new();
-        assert!(blueos::application::load_image(input).is_err());
+        assert!(blueos::loader::load_image(input).is_err());
     }
 
     #[test]
     fn test_invalid_magic() {
         let input = open(unsafe { INVALID_MAGIC_ELF_PATH });
         let _pinned = blueos::support::DisableInterruptGuard::new();
-        assert!(blueos::application::load_image(input).is_err());
+        assert!(blueos::loader::load_image(input).is_err());
     }
 
     #[test]
     fn test_invalid_segment_size() {
         let input = open(unsafe { INVALID_SEGMENT_SIZE_ELF_PATH });
         let _pinned = blueos::support::DisableInterruptGuard::new();
-        assert!(blueos::application::load_image(input).is_err());
+        assert!(blueos::loader::load_image(input).is_err());
     }
 
     // These fixed fixtures are ELF32 little-endian images produced by exec_app.
@@ -216,7 +216,7 @@ mod test_elf_loader {
                 set_exec_word(&mut bytes, header + field, value);
             }
         }
-        let error = blueos::application::load_image(SliceElfReader::new(&bytes))
+        let error = blueos::loader::load_image(SliceElfReader::new(&bytes))
             .err()
             .expect("unregistered placement must fail");
         assert_eq!(error.stage(), Some(loader::error::LoadStage::Allocate));
@@ -233,7 +233,7 @@ mod test_elf_loader {
             .unwrap();
         set_exec_word(&mut bytes, header + 20, size);
         let before = unsafe { (TEST_REGION_START as *const u32).read_volatile() };
-        let error = blueos::application::load_image(SliceElfReader::new(&bytes))
+        let error = blueos::loader::load_image(SliceElfReader::new(&bytes))
             .err()
             .expect("crossing the window boundary must fail");
         assert_eq!(error.stage(), Some(loader::error::LoadStage::Allocate));
@@ -247,13 +247,13 @@ mod test_elf_loader {
     fn test_exec_releases_fixed_region_after_image_drop() {
         let bytes = read_all(unsafe { LOADER_TEST_ELF_PATH }).unwrap();
         let _pinned = blueos::support::DisableInterruptGuard::new();
-        let image = blueos::application::load_image(SliceElfReader::new(&bytes))
-            .expect("first fixed mapping");
+        let image =
+            blueos::loader::load_image(SliceElfReader::new(&bytes)).expect("first fixed mapping");
         run(&image);
-        blueos::application::init_fixed_regions(&runner::fixed::TEST_REGIONS).unwrap();
-        assert!(blueos::application::load_image(SliceElfReader::new(&bytes)).is_err());
+        blueos::loader::init_fixed_regions(&runner::fixed::TEST_REGIONS).unwrap();
+        assert!(blueos::loader::load_image(SliceElfReader::new(&bytes)).is_err());
         drop(image);
-        let image = blueos::application::load_image(SliceElfReader::new(&bytes))
+        let image = blueos::loader::load_image(SliceElfReader::new(&bytes))
             .expect("fixed region released and prepared again");
         run(&image);
     }
@@ -271,7 +271,7 @@ pub fn loader_test_runner(tests: &[&dyn Fn()]) {
 pub extern "C" fn main() -> i32 {
     pthread::register_my_posix_tcb();
     #[cfg(loader_test_exec)]
-    blueos::application::init_fixed_regions(&runner::fixed::TEST_REGIONS)
+    blueos::loader::init_fixed_regions(&runner::fixed::TEST_REGIONS)
         .expect("validate and install the platform EXEC window");
     loader_test_main();
     #[cfg(coverage)]

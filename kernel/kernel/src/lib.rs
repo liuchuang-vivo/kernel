@@ -49,8 +49,6 @@
 
 extern crate alloc;
 pub mod allocator;
-#[cfg(loader_backend)]
-pub mod application;
 pub mod arch;
 #[cfg(kernel_async)]
 pub mod asynk;
@@ -66,6 +64,8 @@ pub(crate) mod drivers;
 pub mod error;
 pub mod ffi;
 pub mod irq;
+#[cfg(loader_backend)]
+pub mod loader;
 pub mod logger;
 pub mod mm;
 #[cfg(enable_net)]

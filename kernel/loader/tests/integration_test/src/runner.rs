@@ -72,12 +72,12 @@ pub(super) mod fixed {
     pub const TEST_REGION_PERMISSIONS: loader::MemoryPermissions =
         parse_permissions(env!("LOADER_TEST_RELOCATION_PERMISSIONS"));
 
-    pub static TEST_REGIONS: [blueos::application::adapters::MemoryRegion; 1] = [unsafe {
+    pub static TEST_REGIONS: [blueos::loader::adapters::MemoryRegion; 1] = [unsafe {
         // SAFETY: this test configuration supplies mapped RTC storage with no
         // other users. Tests access it only while holding the region claim.
         // The test platform is responsible for keeping it outside the heap and
         // other objects; the kernel and loader do not verify that separation.
-        blueos::application::adapters::MemoryRegion::new(
+        blueos::loader::adapters::MemoryRegion::new(
             TEST_REGION_START,
             TEST_REGION_END,
             TEST_REGION_PERMISSIONS,

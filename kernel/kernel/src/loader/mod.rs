@@ -20,7 +20,7 @@
 //! lifecycle remain separate.
 
 pub mod adapters;
-mod loader;
+mod load;
 
 pub use adapters::flat_memory::init_fixed_regions;
-pub use loader::{board_load_profile, load_image, load_request};
+pub use load::{board_load_profile, load_image, load_request};
