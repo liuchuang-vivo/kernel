@@ -111,9 +111,21 @@ macro_rules! unsupported_handler {
     };
 }
 
-unsupported_handler!(el0_not_supported, "el0 is not supported.");
+exception_handler!(el0_sync, trap_sync_from_el0);
+exception_handler!(el0_irq, trap_irq);
+exception_handler!(el0_fiq, trap_fiq);
+exception_handler!(el0_error, trap_exception);
 
-unsupported_handler!(lowerel_not_supported, "lowerel is not supported.");
+unsupported_handler!(
+    current_el_sp0_not_supported,
+    "exception at current EL with SP0 is not supported."
+);
+
+unsupported_handler!(
+    lowerel_aarch32_not_supported,
+    "lower EL using AArch32 is not supported."
+);
+
 #[unsafe(naked)]
 unsafe extern "C" fn trap_sync() -> ! {
     naked_asm!(
@@ -128,6 +140,18 @@ unsafe extern "C" fn trap_sync() -> ! {
         ",
         handle_svc = sym handle_svc,
         might_switch = sym might_switch,
+    );
+}
+
+#[cfg_attr(compatible_old_toolchain, naked)]
+#[cfg_attr(not(compatible_old_toolchain), unsafe(naked))]
+unsafe extern "C" fn trap_sync_from_el0() -> ! {
+    naked_asm!(
+        "
+        bl {handle_svc}
+        mov sp, x0
+        ",
+        handle_svc = sym handle_svc,
     );
 }
 
@@ -157,7 +181,7 @@ extern "C" fn handle_svc(context: &mut Context) -> usize {
         show_exception(ec, context);
         return old_sp;
     }
-    if context.x8 == NR_SWITCH {
+    if context.x8 == NR_SWITCH && (context.spsr & 0xf) != 0 {
         return prepare_for_context_switch(context);
     }
     compiler_fence(Ordering::SeqCst);

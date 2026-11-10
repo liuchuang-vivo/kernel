@@ -23,12 +23,14 @@ pub(crate) mod psci;
 pub(crate) mod vector;
 pub(crate) mod virt;
 
-use crate::{mm::VirtualAddress, scheduler};
+use crate::{
+    mm::{PhysicalAddress, VirtualAddress},
+    scheduler,
+};
 use aarch64_cpu::{
     asm::wfi,
     registers::{Readable, Writeable, DAIF, MPIDR_EL1, SP},
 };
-use crate::mm::PhysicalAddress;
 use core::{
     fmt,
     mem::offset_of,
@@ -201,6 +203,8 @@ macro_rules! aarch64_save_context {
         str x8, [sp, #{elr}]
         mrs x8, spsr_el1
         str x8, [sp, #{spsr}]
+        mrs x8, sp_el0
+        str x8, [sp, #{sp_el0}]
         stp q0, q1, [sp, #{v0}]
         stp q2, q3, [sp, #{v2}]
         stp q4, q5, [sp, #{v4}]
