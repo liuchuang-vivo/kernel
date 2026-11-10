@@ -446,16 +446,16 @@ impl LoadProfile {
                 },
             ));
         }
-        if purpose == LoadPurpose::SharedObject {
-            if let Some(value) = dynamic.value(DT_PREINIT_ARRAY) {
-                return Err(LoadError::new(
-                    LoadErrorKind::UnsupportedByProfile,
-                    ErrorContext::DynamicTag {
-                        tag: DT_PREINIT_ARRAY,
-                        value,
-                    },
-                ));
-            }
+        if purpose == LoadPurpose::SharedObject
+            && let Some(value) = dynamic.value(DT_PREINIT_ARRAY)
+        {
+            return Err(LoadError::new(
+                LoadErrorKind::UnsupportedByProfile,
+                ErrorContext::DynamicTag {
+                    tag: DT_PREINIT_ARRAY,
+                    value,
+                },
+            ));
         }
         Ok(())
     }

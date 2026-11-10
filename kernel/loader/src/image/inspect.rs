@@ -194,21 +194,21 @@ impl<R: ElfReader> InspectedImage<R> {
             .iter()
             .find(|header| header.r#type() == PT_GNU_RELRO)
             .map(|header| TargetRange::new(header.vaddr(), header.memory_size()));
-        if let Some(relro) = relro {
-            if !segments.iter().any(|segment| {
+        if let Some(relro) = relro
+            && !segments.iter().any(|segment| {
                 segment.permissions().contains(MemoryPermissions::WRITE)
                     && TargetRange::new(segment.vaddr(), segment.memory_size())
                         .contains_span(relro.start(), relro.len())
-            }) {
-                return Err(LoadError::new(
-                    LoadErrorKind::PermissionConflict,
-                    ErrorContext::TargetRange {
-                        start: relro.start(),
-                        len: relro.len(),
-                        align: 0,
-                    },
-                ));
-            }
+            })
+        {
+            return Err(LoadError::new(
+                LoadErrorKind::PermissionConflict,
+                ErrorContext::TargetRange {
+                    start: relro.start(),
+                    len: relro.len(),
+                    align: 0,
+                },
+            ));
         }
         let dynamic_header = self
             .program_headers
