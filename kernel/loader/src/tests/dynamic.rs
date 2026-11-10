@@ -33,7 +33,6 @@ use crate::{
         AllocationOffset, ImageLayout, MemoryPermissions, Placement, ProtectionLevel, TargetAddress,
     },
     profile::{ElfClass, ElfData, LoadLimits, LoadProfile, LoadPurpose},
-    tests::support::ProtectionRange,
     ElfReader, ImageAllocator, ImageMapping, LoadError, LoadRequest, LoadResult,
 };
 use alloc::{rc::Rc, vec, vec::Vec};
@@ -290,7 +289,7 @@ struct State {
     fail_write: Cell<Option<usize>>,
     protection_level: Cell<ProtectionLevel>,
     protects: Cell<usize>,
-    protection: RefCell<Vec<ProtectionRange>>,
+    protection: RefCell<Vec<(AllocationOffset, u64, MemoryPermissions)>>,
     fail_protect: Cell<Option<usize>>,
 }
 
@@ -397,7 +396,7 @@ impl ImageMapping for Allocation {
         self.state
             .protection
             .borrow_mut()
-            .push(ProtectionRange::new(offset, len, permissions));
+            .push((offset, len, permissions));
         if self.state.fail_protect.get() == Some(self.state.protects.get()) {
             return Err(LoadError::new(LoadErrorKind::Backend, ErrorContext::None));
         }

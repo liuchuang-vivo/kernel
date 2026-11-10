@@ -68,14 +68,14 @@ if (_loader_execution_enabled) {
     deps = [
       "//external/rust:goblin",
       "//external/rust:semihosting",
-      "//kernel/infra:blueos_infra",
       "//kernel/rsrt",
       "//libs/librs",
     ]
 
-    if (board == "qemu_virt64_aarch64") {
-      deps += [ "//build/boards/qemu_virt64_aarch64:default_linker_script" ]
-    }
+    # Some boards generate their linker script; take the dependency from the
+    # board so the generated input has a path from this target.
+    deps += filter_include(board_deps,
+                           [ "//build/boards/${board}:default_linker_script" ])
     configs += [ "//build/boards/${board}:kernel_config" ]
     rustflags = [ "--test" ]
     linker_script = default_linker_script

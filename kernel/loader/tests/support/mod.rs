@@ -12,13 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Backends shared by unit tests and the external integration runner.
+//! Reader support for loader unit tests; memory behavior uses per-test mocks.
 //! The parent binds `loader` to the loader API; no production module includes this code.
 
 use super::loader;
 
-mod memory;
 mod reader;
 
-pub use memory::{FlatImageAllocation, MemoryMapper, MemoryRegion, ProtectionRange};
 pub use reader::SliceElfReader;

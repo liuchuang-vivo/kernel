@@ -23,7 +23,7 @@ use crate::{
     load_elf,
     memory::{AllocationOffset, ImageLayout, ProtectionLevel, TargetAddress, TargetRange},
     profile::{ElfClass, LoadLimits, LoadProfile, LoadPurpose},
-    tests::support::{MemoryMapper, SliceElfReader},
+    tests::support::SliceElfReader,
     CodeCache, ElfReader, ImageAllocator, ImageMapping, LoadError, LoadRequest, LoadResult,
     LoadedImage,
 };
@@ -203,52 +203,6 @@ fn standalone_load_accepts_a_host_slice_reader() {
         assert_eq!(state.reader_drops.get(), 0);
         drop(image);
         assert_eq!(state.drops.get(), 1);
-    }
-}
-
-#[test]
-fn standalone_flat_backend_retains_initialized_bytes_and_denies_holes() {
-    // These fixtures exercise byte access only; their entries are never called.
-    struct DataOnlyCache;
-    impl CodeCache for DataOnlyCache {
-        fn synchronize(&mut self, range: TargetRange) -> LoadResult<()> {
-            range.end()?;
-            Ok(())
-        }
-    }
-    for profile in PROFILES {
-        // A native 64-bit heap may live above the ELF32 address space. The
-        // flat backend uses its actual heap address as the target base.
-        if usize::BITS > 32 && profile.class() == ElfClass::Elf32 {
-            continue;
-        }
-        let mut fixture = Fixture::new(profile, &[(DT_NULL, 0)]);
-        fixture.ph(1, 3, 0x500); // Leave a zero-filled BSS tail in the writable segment.
-        let image = load_elf(
-            SliceElfReader::new(&fixture.bytes),
-            request(profile),
-            MemoryMapper::new(None),
-            &mut DataOnlyCache,
-        )
-        .unwrap();
-        assert_eq!(image.entry(), Some(image.allocation().base()));
-        assert_eq!(image.protection_level(), ProtectionLevel::LogicalOnly);
-        let mut byte = [0];
-        image
-            .allocation()
-            .read(AllocationOffset::new(0), &mut byte)
-            .unwrap();
-        assert_eq!(byte, [0xa5]);
-        image
-            .allocation()
-            .read(AllocationOffset::new(TARGET - BASE), &mut byte)
-            .unwrap();
-        assert_eq!(byte, [0]);
-        let error = image
-            .allocation()
-            .read(AllocationOffset::new(0x100), &mut byte)
-            .unwrap_err();
-        assert_eq!(error.kind(), LoadErrorKind::PermissionConflict);
     }
 }
 

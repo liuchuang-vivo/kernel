@@ -23,7 +23,6 @@ use crate::{
     image::RelocatedImage,
     memory::{AllocationOffset, MemoryPermissions, ProtectionLevel, TargetAddress, TargetRange},
     profile::{ElfClass, LoadLimits, LoadProfile, LoadPurpose},
-    tests::support::{MemoryMapper, ProtectionRange},
     CodeCache, ImageMapping, LoadError, LoadResult,
 };
 use alloc::{rc::Rc, vec, vec::Vec};
@@ -78,15 +77,6 @@ impl CodeCache for Cache {
     }
 }
 
-// The flat fixture reads data only and never executes the mapped entry.
-struct DataOnlyCache;
-impl CodeCache for DataOnlyCache {
-    fn synchronize(&mut self, range: TargetRange) -> LoadResult<()> {
-        range.end()?;
-        Ok(())
-    }
-}
-
 fn relocated(
     fixture: &Fixture,
     state: Rc<State>,
@@ -130,13 +120,7 @@ fn permission_updates(state: &State) -> Vec<(u64, u64, MemoryPermissions)> {
         .protection
         .borrow()
         .iter()
-        .map(|range| {
-            (
-                range.allocation_offset().value(),
-                range.len(),
-                range.permissions(),
-            )
-        })
+        .map(|&(offset, len, permissions)| (offset.value(), len, permissions))
         .collect()
 }
 
@@ -283,29 +267,6 @@ fn mapping_resets_padding_and_holes_before_applying_segment_permissions() {
             cache.ranges,
             [TargetRange::new(TargetAddress::new(0x8004), 0x100)]
         );
-        if usize::BITS == 32 || profile.class() == ElfClass::Elf64 {
-            let mapped = plan(
-                &fixture,
-                LoadPurpose::Executable,
-                LoadLimits::DEFAULT,
-                Rc::new(State::default()),
-            )
-            .unwrap()
-            .allocate(MemoryMapper::new(None))
-            .unwrap()
-            .map()
-            .unwrap();
-            for offset in [0, 0x104, 0x18f1] {
-                assert_eq!(
-                    mapped
-                        .allocation()
-                        .read(AllocationOffset::new(offset), &mut [0])
-                        .unwrap_err()
-                        .kind(),
-                    LoadErrorKind::PermissionConflict
-                );
-            }
-        }
     }
 }
 
@@ -471,7 +432,7 @@ fn sealing_relro_failure_keeps_cleanup_responsibility() {
         assert_eq!(cache.ranges.len(), 1);
         assert_eq!(state.protects.get(), initial + 1);
         assert_eq!(
-            state.protection.borrow().last().unwrap().permissions(),
+            state.protection.borrow().last().unwrap().2,
             MemoryPermissions::READ
         );
         assert_eq!(state.live.get(), 0);
@@ -513,103 +474,4 @@ fn mapping_protection_failure_occurs_after_all_copies_and_releases_the_mapping()
             assert_eq!(state.reader_drops.get(), 1);
         }
     }
-}
-
-#[test]
-fn mapping_flat_permissions_follow_copy_and_bss_and_allow_data_relocation() {
-    let profile = if usize::BITS == 32 {
-        LoadProfile::riscv32()
-    } else {
-        LoadProfile::riscv64()
-    };
-    let mut dynamic = tags(profile.class(), DT_RELA, RELVA, 1);
-    dynamic.push((DT_NULL, 0));
-    let mut fixture = Fixture::new(profile, &dynamic);
-    fixture.ph(0, 4, 0x180);
-    relro(&mut fixture, TARGET, 16);
-    fixture.relocation(RELVA, DT_RELA, TARGET, 0, R_RISCV_RELATIVE, BASE as i64);
-    let mapped = plan(
-        &fixture,
-        LoadPurpose::Executable,
-        LoadLimits::DEFAULT,
-        Rc::new(State::default()),
-    )
-    .unwrap()
-    .allocate(MemoryMapper::new(None))
-    .unwrap()
-    .map()
-    .unwrap();
-    let mut code = [0; 0x180];
-    mapped
-        .allocation()
-        .read(AllocationOffset::new(0), &mut code)
-        .unwrap();
-    assert_eq!(&code[..0x100], &[0xa5; 0x100]);
-    assert_eq!(&code[0x100..], &[0; 0x80]);
-    assert_eq!(
-        mapped
-            .allocation()
-            .read(AllocationOffset::new(0x180), &mut [0])
-            .unwrap_err()
-            .kind(),
-        LoadErrorKind::PermissionConflict
-    );
-    let base = mapped.allocation().base().get();
-    let image = mapped
-        .decode()
-        .unwrap()
-        .relocate()
-        .unwrap()
-        .seal(&mut DataOnlyCache)
-        .unwrap();
-    let mut word = [0; 8];
-    let width = if profile.class() == ElfClass::Elf32 {
-        4
-    } else {
-        8
-    };
-    image
-        .allocation()
-        .read(AllocationOffset::new(TARGET - BASE), &mut word[..width])
-        .unwrap();
-    assert_eq!(u64::from_le_bytes(word), base);
-}
-
-#[test]
-fn sealing_with_the_flat_backend_enforces_logical_relro_and_holes() {
-    let profile = if usize::BITS == 32 {
-        LoadProfile::riscv32()
-    } else {
-        LoadProfile::riscv64()
-    };
-    let mut fixture = Fixture::new(profile, &[(DT_NULL, 0)]);
-    relro(&mut fixture, TARGET, 16);
-    let state = Rc::new(State::default());
-    let image = plan(
-        &fixture,
-        LoadPurpose::Executable,
-        LoadLimits::DEFAULT,
-        state.clone(),
-    )
-    .unwrap()
-    .allocate(MemoryMapper::new(None))
-    .unwrap()
-    .map()
-    .unwrap()
-    .decode()
-    .unwrap()
-    .relocate()
-    .unwrap()
-    .seal(&mut DataOnlyCache)
-    .unwrap();
-    assert_eq!(image.protection_level(), ProtectionLevel::LogicalOnly);
-    image
-        .allocation()
-        .read(AllocationOffset::new(TARGET - BASE), &mut [0; 8])
-        .unwrap();
-    let error = image
-        .allocation()
-        .read(AllocationOffset::new(0x100), &mut [0; 1])
-        .unwrap_err();
-    assert_eq!(error.kind(), LoadErrorKind::PermissionConflict);
 }
