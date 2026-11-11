@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Reading a native ELF initial stack. This does not initialize libc or run
-//! constructors; the CRT owns that sequence and must execute it exactly once.
+//! Native ELF initial-stack decoding and standalone libc startup.
+
+mod runtime;
+pub use runtime::{__libc_start_main, atexit, environ, exit, getauxval};
 
 use blueos_header::startup::{auxv, AuxvEntry, STACK_ALIGNMENT};
 use core::{
@@ -120,6 +122,9 @@ impl<'a> StartupInfo<'a> {
             key: pair[0],
             value: pair[1],
         })
+    }
+    pub(crate) fn auxv_ptr(&self) -> *const usize {
+        self.auxv.as_ptr()
     }
     pub fn aux_value(&self, key: usize) -> Option<usize> {
         self.auxv()

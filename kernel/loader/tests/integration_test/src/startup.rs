@@ -28,6 +28,7 @@ use librs::startup::StartupInfo;
 
 unsafe extern "C" {
     static STARTUP_TEST_ELF_PATH: *const c_char;
+    static RUNTIME_TEST_ELF_PATH: *const c_char;
 }
 
 fn prepare(
@@ -162,6 +163,16 @@ fn test_startup_enters_independent_elf_in_rtos_thread() {
     // SAFETY: this trusted, single-thread probe implements native ELF entry,
     // checks the frame independently, and exits using BlueKernel's syscall.
     // QEMU's coherent test execution and bootstrap refresh publish its code.
+    let thread = run_storage(storage);
+    // SAFETY: cleanup published completion and this node still owns its stack.
+    assert_eq!(unsafe { CStr::from_ptr(result) }, c"passed!");
+}
+
+fn run_storage(
+    storage: StartupStorage<blueos::loader::adapters::FlatImageAllocation>,
+) -> blueos::thread::ThreadNode {
+    // SAFETY: callers provide trusted native single-thread fixtures; their
+    // private libc/code and stack remain mapped through thread retirement.
     let thread = unsafe { storage.into_thread() };
     assert!(thread.process().is_none());
     let cleanup = thread.lock().take_cleanup().unwrap();
@@ -184,6 +195,49 @@ fn test_startup_enters_independent_elf_in_rtos_thread() {
         blueos::scheduler::yield_me();
     }
     assert_eq!(thread.state(), blueos::thread::RETIRED);
-    // SAFETY: cleanup published completion and this node still owns its stack.
-    assert_eq!(unsafe { CStr::from_ptr(result) }, c"passed!");
+    thread
+}
+
+fn check_runtime(mode: &CStr) {
+    // Each image statically contains an independent copy of librs globals.
+    let path = unsafe { CStr::from_ptr(RUNTIME_TEST_ELF_PATH) };
+    let image = blueos::loader::load_image(super::runner::FileReader::open(path).unwrap()).unwrap();
+    assert_eq!(image.lifecycle().preinit().len(), 1);
+    assert!(image.lifecycle().init().len() >= 2);
+    assert!(image.lifecycle().fini().len() >= 2);
+    // The loader validates plans but libc executes them exactly once.
+    let storage = StartupStorage::new(
+        image,
+        Stack::from_size(32 * 1024).unwrap(),
+        StartupArguments {
+            argv: &[mode, c"...............................", c""],
+            envp: &[c"MODE=test"],
+            page_size: 4096,
+            execfn: None,
+            random: None,
+        },
+    )
+    .unwrap();
+    let result = storage.initial_words()[2] as *const c_char;
+    let thread = run_storage(storage);
+    // Callbacks registered during atexit run before older pending callbacks;
+    // fini arrays run backwards, followed by _fini and main-thread key cleanup.
+    assert_eq!(unsafe { CStr::from_ptr(result) }, c"PIABM231cYXFT");
+    // The fixture counts its allocator, including libc/pthread/emutls metadata.
+    // Its final free publishes zero before the image is unmapped by cleanup.
+    assert_eq!(unsafe { result.cast::<u8>().add(30).read() }, 0);
+    drop(thread);
+}
+
+#[test]
+fn test_librs_startup_main_return_runs_exit_callbacks() {
+    check_runtime(c"return");
+}
+#[test]
+fn test_librs_startup_explicit_exit_runs_exit_callbacks() {
+    check_runtime(c"exit");
+}
+#[test]
+fn test_librs_startup_legacy_callbacks_do_not_repeat_arrays() {
+    check_runtime(c"legacy");
 }

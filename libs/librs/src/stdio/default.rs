@@ -25,13 +25,14 @@ use alloc::{boxed::Box, vec::Vec};
 use core::{cell::UnsafeCell, ptr};
 use libc::c_int;
 
-pub struct GlobalFile(UnsafeCell<FILE>);
+#[must_use = "retain the standard stream until its final flush"]
+pub struct GlobalFile(UnsafeCell<Option<FILE>>);
 
 impl GlobalFile {
     fn new(file: c_int, flags: c_int) -> Self {
         let file = File::new(file);
         let writer = Box::new(LineWriter::new(unsafe { file.get_ref() }));
-        GlobalFile(UnsafeCell::new(FILE {
+        GlobalFile(UnsafeCell::new(Some(FILE {
             lock: GenericMutex::new(()),
             file,
             flags: constants::F_PERM | flags,
@@ -41,10 +42,26 @@ impl GlobalFile {
             unget: Vec::new(),
             writer,
             orientation: 0,
-        }))
+        })))
     }
     pub fn get(&self) -> *mut FILE {
-        self.0.get()
+        // SAFETY: init obtains pointers before publishing the streams; terminal
+        // cleanup runs only after their final user has finished.
+        unsafe {
+            (*self.0.get())
+                .as_mut()
+                .expect("standard stream already released")
+        }
+    }
+
+    unsafe fn finish(&self) {
+        // SAFETY: the standalone runtime excludes all stream users at exit.
+        if let Some(mut stream) = unsafe { (*self.0.get()).take() } {
+            // The RTOS application borrows inherited descriptors. Release libc
+            // buffers without closing another owner's descriptor table entries.
+            stream.file.reference = true;
+            drop(stream);
+        }
     }
 }
 // statics need to be Sync
@@ -70,3 +87,21 @@ pub static mut stdin: *mut FILE = ptr::null_mut();
 pub static mut stdout: *mut FILE = ptr::null_mut();
 #[unsafe(no_mangle)]
 pub static mut stderr: *mut FILE = ptr::null_mut();
+
+/// Flush and release this image's standard stream buffers once.
+///
+/// # Safety
+/// No code may access these streams again, including through default_*().
+/// The caller must exclude all concurrent users and finish TLS destructors first.
+pub(crate) unsafe fn finish() {
+    // SAFETY: runtime initialized the streams and has finished all callbacks.
+    unsafe {
+        super::fflush(ptr::null_mut());
+        stdin = ptr::null_mut();
+        stdout = ptr::null_mut();
+        stderr = ptr::null_mut();
+        default_stdin().finish();
+        default_stdout().finish();
+        default_stderr().finish();
+    }
+}

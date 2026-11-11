@@ -18,6 +18,7 @@
 
 // ffi CStr is unstable yet,
 pub mod malloc;
+pub use crate::startup::{atexit, exit};
 use crate::{c_str::CStr, ctype, errno::ERRNO, types::c_int};
 use core::{
     ffi::{c_char, c_double, c_float, c_long, c_longlong, c_uint, c_ulong, c_ulonglong},
@@ -27,7 +28,25 @@ use libc::{EINVAL, ERANGE};
 
 #[linkage = "weak"]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn getenv(_key: *const i8) -> *mut i8 {
+pub unsafe extern "C" fn getenv(key: *const i8) -> *mut i8 {
+    // SAFETY: the C caller supplies a terminated name; the runtime retains the
+    // environment array and strings, with no concurrent environment mutation.
+    let key = unsafe { core::ffi::CStr::from_ptr(key) }.to_bytes();
+    if key.is_empty() || key.contains(&b'=') {
+        return core::ptr::null_mut();
+    }
+    let mut env = unsafe { crate::startup::environ };
+    while !env.is_null() {
+        let entry = unsafe { env.read() };
+        if entry.is_null() {
+            break;
+        }
+        let bytes = unsafe { core::ffi::CStr::from_ptr(entry) }.to_bytes();
+        if bytes.starts_with(key) && bytes.get(key.len()) == Some(&b'=') {
+            return unsafe { entry.add(key.len() + 1) };
+        }
+        env = unsafe { env.add(1) };
+    }
     core::ptr::null_mut()
 }
 

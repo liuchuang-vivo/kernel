@@ -60,8 +60,10 @@ run_clippy("loader_integration_test_clippy") {
   testonly = true
   deps = [ ":loader_integration_test" ]
   if (_startup_test_enabled) {
-    deps +=
-        [ "//kernel/loader/tests/inputs/startup_app:startup_test_app_clippy" ]
+    deps += [
+      "//kernel/loader/tests/inputs/runtime_app:runtime_test_app_clippy",
+      "//kernel/loader/tests/inputs/startup_app:startup_test_app_clippy",
+    ]
   }
 }
 
