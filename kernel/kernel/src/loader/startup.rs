@@ -14,10 +14,13 @@
 
 //! Standard ELF initial-stack construction for standalone native images.
 
-use super::adapters::KernelCodeCache;
+use super::{
+    adapters::KernelCodeCache,
+    application::{Application, Group},
+};
 use crate::{
     scheduler,
-    thread::{self, Builder, CleanupError, DeferredCleanup, Entry, Stack, ThreadNode},
+    thread::{Builder, CleanupError, Entry, Stack},
 };
 use alloc::boxed::Box;
 use blueos_header::startup::{auxv, STACK_ALIGNMENT};
@@ -185,21 +188,20 @@ impl<A: ImageMapping> StartupStorage<A> {
         unsafe { slice::from_raw_parts(self.initial_sp(), self.words) }
     }
 
-    /// Build an unscheduled RTOS thread. The caller can set its priority and
-    /// enqueue it through the existing scheduler API. Retiring the thread
-    /// posts image cleanup to an ordinary kernel worker; the thread owns the
-    /// whole stack. RETIRED alone does not mean image cleanup has completed.
+    /// Prepare an application without scheduling it. Configure the main thread
+    /// through Application::thread(), then call Application::start(). The image
+    /// and initial stack survive all member threads and their deferred cleanup.
+    /// Dropping a prepared application cancels startup and releases its resources.
     ///
     /// # Safety
-    /// The image must be trusted native code for this kernel, use the ELF
-    /// initial-stack entry convention, and never return from its entry. Its
-    /// allocator must expose executable backing in the kernel's flat address
-    /// space. The caller must satisfy code publication on every CPU where it
-    /// may run, and ensure no image code/data users survive this thread. This
-    /// single-thread adapter does not implement Linux syscalls or child-thread
-    /// ownership; those require a runtime with a longer-lived image owner.
-    #[must_use = "enqueue the returned thread or explicitly cancel and unregister it"]
-    pub unsafe fn into_thread(self) -> Result<ThreadNode, StartupError>
+    /// The image must be trusted native code using the ELF initial-stack entry
+    /// convention and must never return from its entry. Its mapping must expose
+    /// executable backing in the kernel's flat address space. The caller must
+    /// satisfy code publication on every CPU where it may run. All image users
+    /// must be application members created through CreateThread; pointers must
+    /// not escape this lifetime. Normal exit is coordinated by the main thread,
+    /// after children have joined or detached and can finish cooperatively.
+    pub unsafe fn into_application(self) -> Result<Application, StartupError>
     where
         A: Send + 'static,
     {
@@ -210,25 +212,27 @@ impl<A: ImageMapping> StartupStorage<A> {
         let pointer = ptr::from_ref(data.as_ref()).cast_mut().cast::<c_void>();
         // Prepare before registering a thread, so failure drops the image and
         // stack in the caller's context without leaving a global queue entry.
-        let cleanup =
-            DeferredCleanup::new(move || drop(data)).map_err(StartupError::CleanupUnavailable)?;
+        let group = Group::prepare(data);
+        let cleanup = group
+            .main_cleanup()
+            .map_err(StartupError::CleanupUnavailable)?;
         let thread = Builder::new(Entry::Posix(bootstrap::<A>, pointer))
             .set_stack(self.stack)
             .build();
         thread.lock().set_deferred_cleanup(cleanup);
-        Ok(thread)
+        Ok(group.install(thread))
     }
 }
 
-// Held by the thread's cleanup hook, not by an abandoned bootstrap stack frame.
-#[must_use = "the thread cleanup hook retains this image through execution"]
+// Held by the application group, not by an abandoned bootstrap stack frame.
+#[must_use = "the application group retains this image through all member cleanups"]
 struct EntryData<A: ImageMapping> {
     image: LoadedImage<A>,
     sp: usize,
 }
 
 extern "C" fn bootstrap<A: ImageMapping>(pointer: *mut c_void) {
-    // SAFETY: into_thread keeps this immutable owner alive until retirement.
+    // SAFETY: into_application retains this immutable owner through member cleanup.
     let data = unsafe { &*pointer.cast::<EntryData<A>>() };
     let allocation = data.image.allocation();
     // Refresh the current CPU after scheduling as well. This does not replace

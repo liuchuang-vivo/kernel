@@ -22,13 +22,14 @@ use core::{
     alloc::{GlobalAlloc, Layout},
     ffi::{c_char, c_int, c_void, CStr},
     ptr,
+    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
 };
 use librs::startup::{__libc_start_main, atexit, environ, exit, getauxval};
 
 type Init = unsafe extern "C" fn(c_int, *mut *mut c_char, *mut *mut c_char);
 static mut RESULT: *mut u8 = ptr::null_mut();
 static mut LENGTH: usize = 0;
-static mut ALLOCATIONS: usize = 0;
+static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
 struct Allocator;
 unsafe impl GlobalAlloc for Allocator {
@@ -38,7 +39,7 @@ unsafe impl GlobalAlloc for Allocator {
             librs::stdlib::malloc::posix_memalign(&raw mut result, layout.align(), layout.size())
         };
         if rc == 0 {
-            unsafe { ALLOCATIONS += 1 };
+            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
             result.cast()
         } else {
             ptr::null_mut()
@@ -47,11 +48,11 @@ unsafe impl GlobalAlloc for Allocator {
     unsafe fn dealloc(&self, pointer: *mut u8, _layout: Layout) {
         unsafe {
             librs::stdlib::malloc::free(pointer.cast());
-            ALLOCATIONS -= 1;
+            let remaining = ALLOCATIONS.fetch_sub(1, Ordering::AcqRel) - 1;
             if !RESULT.is_null() {
                 // Outside the event string: publish the outstanding allocation
                 // count while image globals still exist, before kernel cleanup.
-                RESULT.add(30).write(u8::try_from(ALLOCATIONS).unwrap());
+                RESULT.add(30).write(u8::try_from(remaining).unwrap());
             }
         };
     }
@@ -180,12 +181,69 @@ unsafe extern "C" fn app_main(
         event(b'M');
         assert_eq!(atexit(exit_one), 0);
         assert_eq!(atexit(exit_two), 0);
-        if CStr::from_ptr(argv.read()) == c"exit" {
+        let mode = CStr::from_ptr(argv.read());
+        if mode == c"exit" {
             exit(23);
+        }
+        if mode == c"join" || mode == c"detach" {
+            let mut child = 0;
+            assert_eq!(
+                librs::pthread::pthread_create(
+                    &raw mut child,
+                    ptr::null(),
+                    child_main,
+                    argv.read().cast(),
+                ),
+                0
+            );
+            if mode == c"join" {
+                let mut result = ptr::null_mut();
+                assert_eq!(librs::pthread::pthread_join(child, &raw mut result), 0);
+                assert_eq!(result as usize, 42);
+            } else {
+                assert_eq!(librs::pthread::pthread_detach(child), 0);
+                // The host releases the child only after the kernel records
+                // Exiting. Main has already returned when it touches env/auxv.
+            }
         }
     }
     17
 }
+extern "C" fn child_main(argument: *mut c_void) -> *mut c_void {
+    unsafe {
+        if CStr::from_ptr(argument.cast()) == c"detach" {
+            let gate = AtomicU8::from_ptr(RESULT.add(29));
+            while gate.load(Ordering::Acquire) != b'G' {
+                bk_syscall!(blueos_header::syscalls::NR::SchedYield);
+            }
+        }
+        // Both envp strings and auxv live in the main thread's initial stack.
+        assert_eq!(
+            CStr::from_ptr(librs::stdlib::getenv(c"MODE".as_ptr())),
+            c"test"
+        );
+        assert_eq!(getauxval(auxv::AT_PAGESZ as _), 4096);
+        librs::errno::ERRNO.set(42);
+        let mut key = 0;
+        assert_eq!(
+            librs::pthread::pthread_key_create(&raw mut key, Some(child_tls_exit)),
+            0
+        );
+        assert_eq!(
+            librs::pthread::pthread_setspecific(key, ptr::dangling::<c_void>()),
+            0
+        );
+        event(b'H');
+    }
+    42usize as *mut c_void
+}
+extern "C" fn child_tls_exit(_value: *mut c_void) {
+    unsafe { event(b'K') };
+}
+extern "C" fn forbidden_child(_argument: *mut c_void) -> *mut c_void {
+    panic!("a finalizer must not create a new application member");
+}
+
 unsafe extern "C" fn exit_one() {
     unsafe { event(b'1') };
 }
@@ -223,6 +281,16 @@ static FINI_TWO: unsafe extern "C" fn() = fini_two;
 #[unsafe(no_mangle)]
 unsafe extern "C" fn _fini() {
     unsafe { event(b'F') };
+    let mut child = 0;
+    assert_eq!(
+        librs::pthread::pthread_create(
+            &raw mut child,
+            ptr::null(),
+            forbidden_child,
+            ptr::null_mut(),
+        ),
+        -1
+    );
 }
 unsafe extern "C" fn legacy_fini() {
     unsafe {

@@ -14,7 +14,10 @@
 
 use alloc::{boxed::Box, sync::Arc};
 use blueos::{
-    loader::{StartupArguments, StartupError, StartupStorage},
+    loader::{
+        Application, ApplicationExit, ApplicationState, StartupArguments, StartupError,
+        StartupStorage,
+    },
     thread::{Cleanup, DeferredCleanup, Stack},
 };
 use blueos_header::startup::{auxv, STACK_ALIGNMENT};
@@ -22,7 +25,7 @@ use blueos_test_macro::test;
 use core::{
     ffi::{c_char, CStr},
     ptr,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
 };
 use librs::startup::StartupInfo;
 
@@ -163,17 +166,26 @@ fn test_startup_enters_independent_elf_in_rtos_thread() {
     // SAFETY: this trusted, single-thread probe implements native ELF entry,
     // checks the frame independently, and exits using BlueKernel's syscall.
     // QEMU's coherent test execution and bootstrap refresh publish its code.
-    let thread = run_storage(storage);
+    let (thread, status) = run_storage(storage);
+    assert_eq!(status, ApplicationExit::Aborted);
     // SAFETY: cleanup published completion and this node still owns its stack.
     assert_eq!(unsafe { CStr::from_ptr(result) }, c"passed!");
 }
 
 fn run_storage(
     storage: StartupStorage<blueos::loader::adapters::FlatImageAllocation>,
-) -> blueos::thread::ThreadNode {
-    // SAFETY: callers provide trusted native single-thread fixtures; their
-    // private libc/code and stack remain mapped through thread retirement.
-    let thread = unsafe { storage.into_thread() }.unwrap();
+) -> (blueos::thread::ThreadNode, ApplicationExit) {
+    run_storage_with(storage, |_| {})
+}
+
+fn run_storage_with(
+    storage: StartupStorage<blueos::loader::adapters::FlatImageAllocation>,
+    before_wait: impl FnOnce(&Application),
+) -> (blueos::thread::ThreadNode, ApplicationExit) {
+    // SAFETY: trusted fixtures keep all code/data users in application members;
+    // native code and initial-stack storage survive every member cleanup.
+    let mut application = unsafe { storage.into_application() }.unwrap();
+    let thread = application.thread().clone();
     assert!(thread.process().is_none());
     let Cleanup::Deferred(cleanup) = thread.lock().take_cleanup().unwrap() else {
         panic!("startup image must use deferred cleanup");
@@ -189,15 +201,17 @@ fn run_storage(
     })
     .unwrap();
     thread.lock().set_deferred_cleanup(cleanup);
-    assert_eq!(
-        blueos::scheduler::queue_ready_thread(blueos::thread::IDLE, thread.clone()),
-        Ok(())
-    );
+    assert_eq!(application.state(), ApplicationState::Prepared);
+    assert_eq!(application.start(None), Ok(()));
+    before_wait(&application);
+    let status = application.wait().unwrap();
+    assert_eq!(application.member_count(), 0);
+    assert_eq!(application.state(), ApplicationState::Exited);
     while !done.load(Ordering::Acquire) {
         blueos::scheduler::yield_me();
     }
     assert_eq!(thread.state(), blueos::thread::RETIRED);
-    thread
+    (thread, status)
 }
 
 fn check_runtime(mode: &CStr) {
@@ -221,10 +235,36 @@ fn check_runtime(mode: &CStr) {
     )
     .unwrap();
     let result = storage.initial_words()[2] as *const c_char;
-    let thread = run_storage(storage);
+    let (thread, status) = run_storage_with(storage, |application| {
+        if mode == c"detach" {
+            let started = blueos::time::now();
+            while application.state() != ApplicationState::Exiting {
+                assert!(
+                    blueos::time::now().saturating_sub(started)
+                        < core::time::Duration::from_secs(2)
+                );
+                blueos::scheduler::yield_me();
+            }
+            assert_eq!(application.member_count(), 2);
+            assert_eq!(application.exit_status(), None);
+            assert_eq!(unsafe { CStr::from_ptr(result) }, c"PIABM");
+            // The child cannot finish until main has entered cooperative exit.
+            unsafe { AtomicU8::from_ptr(result.cast_mut().cast::<u8>().add(29)) }
+                .store(b'G', Ordering::Release);
+        }
+    });
+    assert_eq!(
+        status,
+        ApplicationExit::Code(if mode == c"exit" { 23 } else { 17 })
+    );
     // Callbacks registered during atexit run before older pending callbacks;
     // fini arrays run backwards, followed by _fini and main-thread key cleanup.
-    assert_eq!(unsafe { CStr::from_ptr(result) }, c"PIABM231cYXFT");
+    let expected = if mode == c"join" || mode == c"detach" {
+        c"PIABMHK231cYXFT"
+    } else {
+        c"PIABM231cYXFT"
+    };
+    assert_eq!(unsafe { CStr::from_ptr(result) }, expected);
     // The fixture counts its allocator, including libc/pthread/emutls metadata.
     // Its final free publishes zero before the image is unmapped by cleanup.
     assert_eq!(unsafe { result.cast::<u8>().add(30).read() }, 0);
@@ -242,4 +282,13 @@ fn test_librs_startup_explicit_exit_runs_exit_callbacks() {
 #[test]
 fn test_librs_startup_legacy_callbacks_do_not_repeat_arrays() {
     check_runtime(c"legacy");
+}
+
+#[test]
+fn test_application_waits_for_joined_thread_cleanup() {
+    check_runtime(c"join");
+}
+#[test]
+fn test_application_waits_for_detached_child_before_fini() {
+    check_runtime(c"detach");
 }

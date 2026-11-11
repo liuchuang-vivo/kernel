@@ -93,6 +93,11 @@ pub mod syscalls {
         TimerSetTime,
         TimerGetOverrun,
         Rename,
+        // Standalone application main-thread exit: close admission and wait
+        // for children, then report libc finalization and retire. Custom BlueOS
+        // operations, not Linux exit/exit_group syscall numbers.
+        ApplicationBeginExit,
+        ApplicationFinishExit,
         LastNR,
     }
 }

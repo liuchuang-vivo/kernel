@@ -13,14 +13,18 @@
 // limitations under the License.
 
 //! Startup for a self-contained ELF with its own statically linked librs.
-//! This copy of libc and its globals belong to one single-thread application.
-//! Shared libc, interpreter startup and process-wide termination are separate
-//! integration work; the current kernel exit operation retires one RTOS thread.
+//! This copy of libc and its globals belong to one application thread group.
+//! The main thread closes admission and waits for cooperative child cleanup
+//! before touching shared libc state. Shared libc, interpreters and forced
+//! process-wide cancellation are separate integration work.
 
 use super::StartupInfo;
 use crate::{errno::ERRNO, sync::GenericMutex};
 use alloc::vec::Vec;
-use blueos_header::{startup::auxv, syscalls::NR::ExitThread};
+use blueos_header::{
+    startup::auxv,
+    syscalls::NR::{ApplicationBeginExit, ApplicationFinishExit, ExitThread},
+};
 use blueos_scal::bk_syscall;
 use core::{
     ffi::{c_char, c_int, c_ulong, c_void},
@@ -161,18 +165,24 @@ pub extern "C" fn getauxval(key: c_ulong) -> c_ulong {
     0
 }
 
-/// Terminate the current standalone, single-thread ELF application. This is
-/// not process-wide exit: child-thread quiescence and status reporting require
-/// the later kernel application owner. Explicit exit and main return share it.
+/// Terminate a standalone application from its main thread. Stop accepting new
+/// children and wait for existing children and their cleanup before atexit/fini.
+/// This cooperative RTOS path does not cancel children blocked indefinitely.
 ///
 /// # Safety
-/// This must be the sole thread of an application started by __libc_start_main,
-/// with no surviving users of its image, streams or thread-local state.
+/// The caller must be the main thread started by __libc_start_main. Children
+/// must have joined or detached and be able to finish without main running.
+/// No users of the image or this libc may exist outside the application group.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn exit(_status: c_int) -> ! {
+pub unsafe extern "C" fn exit(status: c_int) -> ! {
     if EXITING.swap(true, Ordering::AcqRel) {
         retire();
     }
+    assert_eq!(
+        bk_syscall!(ApplicationBeginExit, status),
+        0,
+        "application exit requires its main thread"
+    );
     loop {
         let callback = CALLBACKS.lock().pop();
         let Some(callback) = callback else { break };
@@ -187,7 +197,8 @@ pub unsafe extern "C" fn exit(_status: c_int) -> ! {
     crate::pthread::cleanup_my_tcb();
     AUXV.store(ptr::null_mut(), Ordering::Release);
     unsafe { environ = ptr::null_mut() };
-    retire()
+    bk_syscall!(ApplicationFinishExit);
+    unreachable!("ApplicationFinishExit returned")
 }
 
 unsafe fn run_init_array(

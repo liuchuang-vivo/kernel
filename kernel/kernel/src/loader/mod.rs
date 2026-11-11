@@ -17,13 +17,15 @@
 //! The loader core stays independent of kernel types. This module supplies the
 //! flat memory mapping, instruction publication and native profile, then hands
 //! the owning `LoadedImage` back to the caller. Startup storage retains that
-//! image and its ABI buffers; scheduling and lifecycle execution stay with
-//! the caller.
+//! image and its ABI buffers. Application starts and observes the thread group,
+//! while the application libc executes initialization and finalization.
 
 pub mod adapters;
+pub(crate) mod application;
 mod load;
 mod startup;
 
 pub use adapters::flat_memory::init_fixed_regions;
+pub use application::{Application, ApplicationError, ApplicationExit, ApplicationState};
 pub use load::{board_load_profile, load_image, load_request};
 pub use startup::{StartupArguments, StartupError, StartupStorage};
