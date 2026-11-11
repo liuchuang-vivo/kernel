@@ -45,7 +45,7 @@ unsafe impl GlobalAlloc for PosixAllocator {
         }
 
         let mut mem_ptr: *mut c_void = ptr::null_mut();
-        let align = layout.align();
+        let align = layout.align().max(core::mem::size_of::<*mut c_void>());
         let size = layout.size();
 
         let result = unsafe {

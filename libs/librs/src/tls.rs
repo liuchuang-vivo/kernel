@@ -124,8 +124,8 @@ fn allocate_object(ctrl: &EmutlsControl) -> *mut u8 {
     unsafe {
         // We'll deallocate it via `free()`.
         let rc = posix_memalign(
-            &mut base as *mut *mut u8 as *mut *mut libc::c_void,
-            align,
+            (&raw mut base).cast(),
+            align.max(core::mem::size_of::<*mut c_void>()),
             size,
         );
         assert_eq!(rc, 0);

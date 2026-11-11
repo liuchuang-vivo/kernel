@@ -510,7 +510,9 @@ define_syscall_handler!(
 
 define_syscall_handler!(
 alloc_mem(ptr: *mut *mut c_void, size: usize, align: usize) -> c_long {
-    if ptr.is_null() {
+    if ptr.is_null() || !ptr.is_aligned()
+        || core::alloc::Layout::from_size_align(size, align).is_err()
+    {
         return -1;
     }
     let addr = crate::allocator::malloc_align(size, align);
@@ -524,6 +526,22 @@ alloc_mem(ptr: *mut *mut c_void, size: usize, align: usize) -> c_long {
 define_syscall_handler!(
 free_mem(ptr: *mut c_void) -> c_long {
     crate::allocator::free(ptr as *mut u8);
+    0
+});
+
+// Preserve libc's minimum alignment while the kernel recovers the old size.
+define_syscall_handler!(
+realloc_mem(output: *mut *mut c_void, old: *mut c_void, size: usize, align: usize) -> c_long {
+    if output.is_null() || !output.is_aligned()
+        || core::alloc::Layout::from_size_align(size, align).is_err()
+    {
+        return -1;
+    }
+    let moved = crate::allocator::realloc_align(old.cast(), size, align);
+    if moved.is_null() && size != 0 { return -1; }
+    // The flat syscall ABI requires an exclusive output slot valid throughout
+    // the call, outside the allocation being resized. Failure leaves it intact.
+    unsafe { output.write(moved.cast()) };
     0
 });
 
@@ -923,6 +941,7 @@ syscall_table! {
     (TimerGetOverrun, timer_getoverrun),
     (AllocMem, alloc_mem),
     (FreeMem, free_mem),
+    (ReallocMem, realloc_mem),
     (Write, write),
     (Close, close),
     (Read, read),

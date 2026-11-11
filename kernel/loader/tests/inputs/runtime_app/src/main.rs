@@ -36,7 +36,11 @@ unsafe impl GlobalAlloc for Allocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let mut result = ptr::null_mut();
         let rc = unsafe {
-            librs::stdlib::malloc::posix_memalign(&raw mut result, layout.align(), layout.size())
+            librs::stdlib::malloc::posix_memalign(
+                &raw mut result,
+                layout.align().max(size_of::<*mut c_void>()),
+                layout.size(),
+            )
         };
         if rc == 0 {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);

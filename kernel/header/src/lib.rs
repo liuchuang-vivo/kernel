@@ -98,6 +98,7 @@ pub mod syscalls {
         // operations, not Linux exit/exit_group syscall numbers.
         ApplicationBeginExit,
         ApplicationFinishExit,
+        ReallocMem,
         LastNR,
     }
 }

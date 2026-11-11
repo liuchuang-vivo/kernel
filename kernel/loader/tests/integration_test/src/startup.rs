@@ -32,6 +32,7 @@ use librs::startup::StartupInfo;
 unsafe extern "C" {
     static STARTUP_TEST_ELF_PATH: *const c_char;
     static RUNTIME_TEST_ELF_PATH: *const c_char;
+    static STD_TEST_ELF_PATH: *const c_char;
 }
 
 fn prepare(
@@ -291,4 +292,28 @@ fn test_application_waits_for_joined_thread_cleanup() {
 #[test]
 fn test_application_waits_for_detached_child_before_fini() {
     check_runtime(c"detach");
+}
+
+#[test]
+fn test_static_pie_crt_runs_rust_std_main_and_thread() {
+    let path = unsafe { CStr::from_ptr(STD_TEST_ELF_PATH) };
+    let image = blueos::loader::load_image(super::runner::FileReader::open(path).unwrap()).unwrap();
+    let storage = StartupStorage::new(
+        image,
+        Stack::from_size(64 * 1024).unwrap(),
+        StartupArguments {
+            argv: &[c"rust-std-probe", c"..............................."],
+            envp: &[c"MODE=rust-std"],
+            page_size: 4096,
+            execfn: None,
+            random: None,
+        },
+    )
+    .unwrap();
+    let result = storage.initial_words()[2] as *const c_char;
+    let (thread, status) = run_storage(storage);
+    assert_eq!(status, ApplicationExit::Code(37));
+    // Real Rust lang_start/main, a std thread's TLS destructor, then libc fini.
+    assert_eq!(unsafe { CStr::from_ptr(result) }, c"IMTDRF");
+    drop(thread);
 }

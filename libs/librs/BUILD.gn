@@ -66,6 +66,21 @@ if (board_toolchain_info.current_cpu == "riscv32") {
   }
 }
 
+# Standard ELF entry for self-contained applications. Keep the firmware's
+# rsrt/__librs_start_main path separate from this application-side CRT.
+if (board_toolchain_info.current_cpu == "riscv32" ||
+    board_toolchain_info.current_cpu == "riscv64" ||
+    board_toolchain_info.current_cpu == "aarch64") {
+  static_library("crt1") {
+    if (board_toolchain_info.current_cpu == "aarch64") {
+      sources = [ "start/aarch64/crt1.S" ]
+    } else {
+      sources = [ "start/riscv/crt1.S" ]
+    }
+    cflags = [ "-fPIC" ]
+  }
+}
+
 run_clippy("librs_swi_clippy") {
   deps = [ ":librs_swi" ]
 }
