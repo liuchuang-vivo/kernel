@@ -15,7 +15,7 @@
 use alloc::{boxed::Box, sync::Arc};
 use blueos::{
     loader::{StartupArguments, StartupError, StartupStorage},
-    thread::{Entry, Stack},
+    thread::{Cleanup, DeferredCleanup, Stack},
 };
 use blueos_header::startup::{auxv, STACK_ALIGNMENT};
 use blueos_test_macro::test;
@@ -173,20 +173,22 @@ fn run_storage(
 ) -> blueos::thread::ThreadNode {
     // SAFETY: callers provide trusted native single-thread fixtures; their
     // private libc/code and stack remain mapped through thread retirement.
-    let thread = unsafe { storage.into_thread() };
+    let thread = unsafe { storage.into_thread() }.unwrap();
     assert!(thread.process().is_none());
-    let cleanup = thread.lock().take_cleanup().unwrap();
+    let Cleanup::Deferred(cleanup) = thread.lock().take_cleanup().unwrap() else {
+        panic!("startup image must use deferred cleanup");
+    };
     let done = Arc::new(AtomicBool::new(false));
     let finished = done.clone();
-    thread.lock().set_cleanup(Entry::Closure(Box::new(move || {
-        let Entry::Closure(cleanup) = cleanup else {
-            panic!("startup cleanup");
-        };
-        cleanup();
-        // The scheduler calls this after execution has stopped. Avoid another
-        // scheduler operation from inside the retirement cleanup callback.
+    let cleanup = DeferredCleanup::new(move || {
+        assert!(!blueos::irq::is_in_irq());
+        // Prove that the real image owner is released in schedulable context.
+        blueos::scheduler::yield_me();
+        cleanup.run();
         finished.store(true, Ordering::Release);
-    })));
+    })
+    .unwrap();
+    thread.lock().set_deferred_cleanup(cleanup);
     assert_eq!(
         blueos::scheduler::queue_ready_thread(blueos::thread::IDLE, thread.clone()),
         Ok(())

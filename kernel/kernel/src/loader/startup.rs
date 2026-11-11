@@ -17,7 +17,7 @@
 use super::adapters::KernelCodeCache;
 use crate::{
     scheduler,
-    thread::{self, Builder, Entry, Stack, ThreadNode},
+    thread::{self, Builder, CleanupError, DeferredCleanup, Entry, Stack, ThreadNode},
 };
 use alloc::boxed::Box;
 use blueos_header::startup::{auxv, STACK_ALIGNMENT};
@@ -36,6 +36,7 @@ pub enum StartupError {
     InvalidPageSize,
     TooManyArguments,
     StackTooSmall,
+    CleanupUnavailable(CleanupError),
 }
 
 /// Platform values and strings copied into the new application's stack.
@@ -186,7 +187,8 @@ impl<A: ImageMapping> StartupStorage<A> {
 
     /// Build an unscheduled RTOS thread. The caller can set its priority and
     /// enqueue it through the existing scheduler API. Retiring the thread
-    /// drops the image from its cleanup hook; the thread owns the whole stack.
+    /// posts image cleanup to an ordinary kernel worker; the thread owns the
+    /// whole stack. RETIRED alone does not mean image cleanup has completed.
     ///
     /// # Safety
     /// The image must be trusted native code for this kernel, use the ELF
@@ -197,7 +199,7 @@ impl<A: ImageMapping> StartupStorage<A> {
     /// single-thread adapter does not implement Linux syscalls or child-thread
     /// ownership; those require a runtime with a longer-lived image owner.
     #[must_use = "enqueue the returned thread or explicitly cancel and unregister it"]
-    pub unsafe fn into_thread(self) -> ThreadNode
+    pub unsafe fn into_thread(self) -> Result<ThreadNode, StartupError>
     where
         A: Send + 'static,
     {
@@ -206,13 +208,15 @@ impl<A: ImageMapping> StartupStorage<A> {
             image: self.image,
         });
         let pointer = ptr::from_ref(data.as_ref()).cast_mut().cast::<c_void>();
+        // Prepare before registering a thread, so failure drops the image and
+        // stack in the caller's context without leaving a global queue entry.
+        let cleanup =
+            DeferredCleanup::new(move || drop(data)).map_err(StartupError::CleanupUnavailable)?;
         let thread = Builder::new(Entry::Posix(bootstrap::<A>, pointer))
             .set_stack(self.stack)
             .build();
-        thread
-            .lock()
-            .set_cleanup(Entry::Closure(Box::new(move || drop(data))));
-        thread
+        thread.lock().set_deferred_cleanup(cleanup);
+        Ok(thread)
     }
 }
 

@@ -45,6 +45,9 @@ use core::{
 
 mod builder;
 pub use builder::*;
+mod deferred;
+pub(crate) use deferred::post as post_deferred_cleanup;
+pub use deferred::{CleanupError, DeferredCleanup};
 
 pub type ThreadNode = Arc<Thread>;
 
@@ -61,6 +64,14 @@ impl core::fmt::Debug for Entry {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         Ok(())
     }
+}
+
+/// Select whether retirement executes a callback inline or posts it to a worker.
+#[derive(Debug)]
+#[must_use = "retain the callback until retirement or explicitly execute it"]
+pub enum Cleanup {
+    Inline(Entry),
+    Deferred(DeferredCleanup),
 }
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
@@ -234,7 +245,7 @@ pub struct Thread {
     global: GlobalQueueListHead,
     sched_node: IlistHead<Thread, OffsetOfSchedNode>,
     // Cleanup function will be invoked when retiring.
-    cleanup: Option<Entry>,
+    cleanup: Option<Cleanup>,
     kind: ThreadKind,
     // Thread owns Stack::Alloc. It calls dealloc when dropping its self.
     stack: Stack,
@@ -464,13 +475,20 @@ impl Thread {
     }
 
     #[inline]
-    pub fn take_cleanup(&mut self) -> Option<Entry> {
+    pub fn take_cleanup(&mut self) -> Option<Cleanup> {
         self.cleanup.take()
     }
 
     #[inline]
     pub fn set_cleanup(&mut self, cleanup: Entry) {
-        self.cleanup = Some(cleanup);
+        self.cleanup = Some(Cleanup::Inline(cleanup));
+    }
+
+    /// Install a prepared callback for ordinary worker execution at retirement.
+    /// Prepare it with DeferredCleanup::new outside this thread's lock. The
+    /// worker does not inherit this thread's Process or fd table.
+    pub fn set_deferred_cleanup(&mut self, cleanup: DeferredCleanup) {
+        self.cleanup = Some(Cleanup::Deferred(cleanup));
     }
 
     #[inline]
