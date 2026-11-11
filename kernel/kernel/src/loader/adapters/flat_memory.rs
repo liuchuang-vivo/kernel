@@ -411,10 +411,10 @@ impl ImageMapping for FlatImageAllocation {
         if len == 0 {
             return Ok(());
         }
-        if let FlatBacking::Fixed(region) = &self.backing {
-            if !region.permissions.contains(permissions) {
-                return Err(fail(LoadErrorKind::PermissionConflict));
-            }
+        if let FlatBacking::Fixed(region) = &self.backing
+            && !region.permissions.contains(permissions)
+        {
+            return Err(fail(LoadErrorKind::PermissionConflict));
         }
 
         let previous = &self.protection;
@@ -469,17 +469,16 @@ fn append_protection(
     len: u64,
     permissions: MemoryPermissions,
 ) {
-    if let Some(previous) = ranges.last_mut() {
-        if previous.permissions() == permissions
-            && previous.allocation_offset().value() + previous.len() == start
-        {
-            *previous = ProtectionRange::new(
-                previous.allocation_offset(),
-                previous.len() + len,
-                permissions,
-            );
-            return;
-        }
+    if let Some(previous) = ranges.last_mut()
+        && previous.permissions() == permissions
+        && previous.allocation_offset().value() + previous.len() == start
+    {
+        *previous = ProtectionRange::new(
+            previous.allocation_offset(),
+            previous.len() + len,
+            permissions,
+        );
+        return;
     }
     ranges.push(ProtectionRange::new(
         AllocationOffset::new(start),
