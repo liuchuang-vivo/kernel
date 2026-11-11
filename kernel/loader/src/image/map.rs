@@ -20,12 +20,13 @@ use crate::{
     elf::{DynamicInfo, ElfHeaderInfo, LoadSegmentInfo, RelocationRecord},
     error::{ErrorContext, LimitKind, LoadErrorKind, LoadStage},
     memory::{AllocationOffset, ImageMapping, TargetAddress, TargetRange},
-    LoadError, LoadRequest, LoadResult,
+    LoadError, LoadRequest, LoadResult, ProgramHeaderTable,
 };
 use alloc::vec::Vec;
 
 #[must_use = "keep the mapped image alive to retain its backing"]
 pub(crate) struct MappedImage<A: ImageMapping> {
+    pub(super) program_headers: Option<ProgramHeaderTable>,
     pub(super) allocation: A,
     pub(super) request: LoadRequest,
     pub(super) header: ElfHeaderInfo,
@@ -107,6 +108,7 @@ impl<A: ImageMapping> MappedImage<A> {
             }
         }
         Ok(DecodedImage {
+            program_headers: self.program_headers,
             allocation: self.allocation,
             request: self.request,
             segments: self.segments,

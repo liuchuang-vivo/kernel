@@ -74,17 +74,23 @@ pub enum ThreadKind {
 }
 
 #[derive(Debug)]
-pub struct Stack(Storage);
+#[must_use = "retain the stack until its execution and payload accesses finish"]
+pub struct Stack {
+    storage: Storage,
+    usable_len: usize,
+}
 
 impl Stack {
+    /// End of the execution stack. Reserved startup data may follow it in
+    /// the same allocation and remains owned by this stack.
     #[inline]
     pub fn top(&self) -> *mut u8 {
-        unsafe { self.0.base().add(self.size()) }
+        unsafe { self.storage.base().add(self.size()) }
     }
 
     #[inline]
     pub fn base(&self) -> *mut u8 {
-        self.0.base()
+        self.storage.base()
     }
 
     #[inline]
@@ -98,11 +104,17 @@ impl Stack {
         if storage.base().is_null() {
             return None;
         }
-        Some(Self(storage))
+        Some(Self {
+            storage,
+            usable_len: size,
+        })
     }
 
     pub const fn new() -> Self {
-        Self(Storage::new())
+        Self {
+            storage: Storage::new(),
+            usable_len: 0,
+        }
     }
 
     #[inline]
@@ -117,11 +129,29 @@ impl Stack {
         if !(base as usize).is_multiple_of(ALIGN) {
             return None;
         }
-        Some(Self(unsafe { Storage::from_raw(base, size) }))
+        Some(Self {
+            storage: unsafe { Storage::from_raw(base, size) },
+            usable_len: size,
+        })
     }
 
+    /// Execution-stack length, excluding any reserved startup payload.
     pub fn size(&self) -> usize {
-        self.0.size()
+        self.usable_len
+    }
+
+    /// Reserve a payload above the execution stack, retaining the original
+    /// allocation and deallocation layout. Thread::init uses the reduced top,
+    /// so its context and bootstrap frames cannot overwrite the payload.
+    pub(crate) fn reserve_top(&mut self, bytes: usize) -> Option<*mut u8> {
+        let len = self.usable_len.checked_sub(bytes)?;
+        if len < core::mem::size_of::<Context>() + core::mem::align_of::<Context>()
+            || !(self.base().addr() + len).is_multiple_of(core::mem::align_of::<Context>())
+        {
+            return None;
+        }
+        self.usable_len = len;
+        Some(self.top())
     }
 }
 
@@ -640,7 +670,7 @@ impl Thread {
     }
 
     /// High address
-    /// ------------------------------ <--- stack.top() == allocated buffer end
+    /// ------------------------------ <--- stack.top() (below any reserved payload)
     /// | optional align gap (0..A)  |
     /// ------------------------------
     /// | Context for current thread |

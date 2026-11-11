@@ -20,12 +20,13 @@ use crate::{
     error::{ErrorContext, LoadErrorKind, LoadStage},
     lifecycle::LifecyclePlan,
     memory::{AllocationOffset, ImageMapping, MemoryPermissions, TargetAddress, TargetRange},
-    CodeCache, LoadError, LoadRequest, LoadResult,
+    CodeCache, LoadError, LoadRequest, LoadResult, ProgramHeaderTable,
 };
 use alloc::vec::Vec;
 
 #[must_use = "retain the relocated image to keep its allocation alive"]
 pub(crate) struct RelocatedImage<A: ImageMapping> {
+    pub(super) program_headers: Option<ProgramHeaderTable>,
     pub(super) allocation: A,
     pub(super) request: LoadRequest,
     pub(super) segments: Vec<LoadSegmentInfo>,
@@ -110,6 +111,7 @@ impl<A: ImageMapping> RelocatedImage<A> {
                 })?;
         }
         Ok(SealedImage {
+            program_headers: self.program_headers,
             allocation: self.allocation,
             request: self.request,
             segments: self.segments,

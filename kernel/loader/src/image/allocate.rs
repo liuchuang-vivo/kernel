@@ -20,7 +20,7 @@ use crate::{
     error::{ErrorContext, LoadErrorKind, LoadStage},
     memory::{AllocationOffset, ImageMapping, MemoryPermissions, TargetAddress, TargetRange},
     reader::ElfReader,
-    LoadError, LoadRequest, LoadResult,
+    LoadError, LoadRequest, LoadResult, ProgramHeaderTable,
 };
 use alloc::vec::Vec;
 
@@ -46,6 +46,37 @@ impl<R: ElfReader, A: ImageMapping> AllocatedImage<R, A> {
 
     fn map_inner(mut self) -> LoadResult<MappedImage<A>> {
         let base = self.allocation.base();
+        // Retain only the actual table descriptor, not all decoded headers.
+        // Some embedded images leave the table outside their PT_LOAD ranges;
+        // loading them remains valid, but a standard startup cannot use AT_PHDR.
+        let mut program_headers = None;
+        let table_start = self.header.program_header_offset();
+        let table_len = u64::from(self.header.program_header_entry_size())
+            * u64::from(self.header.program_header_count());
+        if table_len != 0 {
+            for segment in &self.segments {
+                let file = segment.file_range();
+                if segment.permissions().contains(MemoryPermissions::READ)
+                    && let Some(offset) = table_start.checked_sub(file.offset())
+                    && offset <= file.len()
+                    && table_len <= file.len() - offset
+                {
+                    let offset = segment
+                        .vaddr()
+                        .checked_sub(self.image_range.start())?
+                        .checked_add(offset)
+                        .ok_or_else(|| {
+                            LoadError::new(LoadErrorKind::IntegerOverflow, ErrorContext::None)
+                        })?;
+                    program_headers = Some(ProgramHeaderTable::new(
+                        base.checked_add(offset)?,
+                        self.header.program_header_entry_size(),
+                        self.header.program_header_count(),
+                    ));
+                    break;
+                }
+            }
+        }
         let entry = if self.header.entry() == 0 {
             None
         } else {
@@ -147,6 +178,7 @@ impl<R: ElfReader, A: ImageMapping> AllocatedImage<R, A> {
                 })?;
         }
         Ok(MappedImage {
+            program_headers,
             allocation: self.allocation,
             request: self.request,
             header: self.header,

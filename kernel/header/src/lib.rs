@@ -14,6 +14,8 @@
 
 #![no_std]
 
+pub mod startup;
+
 pub mod syscalls {
     //! BlueOS's syscall calling convention is compatible with Linux.
     // FIXME: We should really consider stable syscall nr.

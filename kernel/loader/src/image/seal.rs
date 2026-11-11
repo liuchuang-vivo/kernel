@@ -18,13 +18,14 @@ use crate::{
     elf::{DynamicInfo, LoadSegmentInfo},
     lifecycle::LifecyclePlan,
     memory::{ImageMapping, ProtectionLevel, TargetAddress, TargetRange},
-    LoadRequest,
+    LoadRequest, ProgramHeaderTable,
 };
 use alloc::vec::Vec;
 
 /// Memory finalization does not execute initialization or start the application.
 #[must_use = "retain the sealed image to keep its allocation alive"]
 pub(crate) struct SealedImage<A: ImageMapping> {
+    pub(crate) program_headers: Option<ProgramHeaderTable>,
     pub(crate) allocation: A,
     pub(super) request: LoadRequest,
     pub(super) segments: Vec<LoadSegmentInfo>,

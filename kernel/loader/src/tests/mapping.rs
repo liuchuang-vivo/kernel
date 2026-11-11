@@ -92,6 +92,67 @@ fn planned(bytes: &[u8], profile: LoadProfile) -> PlannedImage<SliceElfReader<'_
     .unwrap()
 }
 
+#[test]
+fn loaded_program_header_table_requires_complete_file_backing() {
+    struct Cache;
+    impl crate::CodeCache for Cache {
+        fn synchronize(&mut self, _: TargetRange) -> LoadResult<()> {
+            Ok(())
+        }
+    }
+    for profile in PROFILES {
+        let (header_size, entry_size) = match profile.class() {
+            ElfClass::Elf32 => (52, 32),
+            ElfClass::Elf64 => (64, 56),
+        };
+        for (offset, filesz, retained) in [
+            (0, 0x200, true),
+            (0x200, 0x200, false),
+            (0, header_size + entry_size - 1, false),
+        ] {
+            let builder = match profile.class() {
+                ElfClass::Elf32 => ElfFixtureBuilder::elf32(EM_RISCV, ET_DYN),
+                ElfClass::Elf64 => ElfFixtureBuilder::elf64(
+                    if profile == LoadProfile::aarch64() {
+                        EM_AARCH64
+                    } else {
+                        EM_RISCV
+                    },
+                    ET_DYN,
+                ),
+            };
+            let mut bytes = builder
+                .with_entry(0x1180)
+                .with_program_header(ProgramHeaderFixture {
+                    offset,
+                    filesz,
+                    memsz: 0x200,
+                    align: 16,
+                    ..ProgramHeaderFixture::load()
+                })
+                .build();
+            bytes.resize((offset + 0x200) as usize, 0);
+            let image = crate::load_elf(
+                SliceElfReader::new(&bytes),
+                LoadRequest::new(profile, LoadLimits::DEFAULT),
+                MockMemory::new(0x8000),
+                &mut Cache,
+            )
+            .unwrap();
+            if retained {
+                let table = image.program_headers().unwrap();
+                assert_eq!(table.address().get(), 0x8000 + header_size);
+                assert_eq!(u64::from(table.entry_size()), entry_size);
+                assert_eq!(table.count(), 1);
+            } else {
+                // A table absent from PT_LOAD, or extending into its BSS, is
+                // not a valid AT_PHDR even though the image itself can load.
+                assert!(image.program_headers().is_none());
+            }
+        }
+    }
+}
+
 fn failure<T>(result: LoadResult<T>) -> LoadError {
     match result {
         Err(error) => error,

@@ -44,6 +44,7 @@ mod lifecycle;
 mod load;
 mod relocation;
 
+pub use elf::ProgramHeaderTable;
 pub use lifecycle::LifecyclePlan;
 pub use load::{load_elf, LoadRequest, LoadedImage};
 

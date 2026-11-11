@@ -17,7 +17,7 @@
 use crate::{
     image::SealedImage,
     memory::{ProtectionLevel, TargetAddress},
-    ImageMapping, LifecyclePlan,
+    ImageMapping, LifecyclePlan, ProgramHeaderTable,
 };
 
 /// Retains image backing and its validated runtime addresses.
@@ -28,6 +28,7 @@ use crate::{
 /// it does not run lifecycle callbacks or stop executing threads.
 #[must_use = "retain the loaded image for as long as its code or data is in use"]
 pub struct LoadedImage<A: ImageMapping> {
+    program_headers: Option<ProgramHeaderTable>,
     allocation: A,
     entry: Option<TargetAddress>,
     lifecycle: LifecyclePlan,
@@ -36,6 +37,7 @@ pub struct LoadedImage<A: ImageMapping> {
 impl<A: ImageMapping> LoadedImage<A> {
     pub(crate) fn from_sealed(image: SealedImage<A>) -> Self {
         Self {
+            program_headers: image.program_headers,
             allocation: image.allocation,
             entry: image.entry,
             lifecycle: image.lifecycle,
@@ -51,6 +53,13 @@ impl<A: ImageMapping> LoadedImage<A> {
     /// when the runtime address is zero; a shared object may have no entry.
     pub const fn entry(&self) -> Option<TargetAddress> {
         self.entry
+    }
+
+    /// Complete readable in-image table, if the ELF maps it through PT_LOAD.
+    /// None does not invalidate loading; hosts requiring AT_PHDR must reject
+    /// startup or supply an appropriate mapping rather than invent an address.
+    pub const fn program_headers(&self) -> Option<ProgramHeaderTable> {
+        self.program_headers
     }
 
     /// Ordered runtime callback addresses, not yet executed by the loader.

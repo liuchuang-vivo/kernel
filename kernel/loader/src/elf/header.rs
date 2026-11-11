@@ -18,6 +18,7 @@ use super::{
 };
 use crate::{
     error::{ErrorContext, HeaderField, LoadErrorKind},
+    memory::TargetAddress,
     LoadError, LoadResult,
 };
 use goblin::elf::header::{
@@ -29,6 +30,37 @@ use goblin::elf::header::{
 pub enum ElfClass {
     Elf32,
     Elf64,
+}
+
+/// A complete program-header table retained in readable PT_LOAD backing.
+/// Its address can be used for ELF AT_PHDR startup metadata.
+/// The descriptor does not own that memory; retain the loaded image while
+/// using its address.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProgramHeaderTable {
+    address: TargetAddress,
+    entry_size: u16,
+    count: u16,
+}
+
+impl ProgramHeaderTable {
+    pub(crate) const fn new(address: TargetAddress, entry_size: u16, count: u16) -> Self {
+        Self {
+            address,
+            entry_size,
+            count,
+        }
+    }
+
+    pub const fn address(&self) -> TargetAddress {
+        self.address
+    }
+    pub const fn entry_size(&self) -> u16 {
+        self.entry_size
+    }
+    pub const fn count(&self) -> u16 {
+        self.count
+    }
 }
 
 impl From<ElfClass> for u64 {
