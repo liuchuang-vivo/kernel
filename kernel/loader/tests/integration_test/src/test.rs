@@ -12,6 +12,8 @@ extern crate alloc;
 extern crate rsrt;
 
 mod runner;
+#[cfg(all(not(loader_test_exec), enable_vfs))]
+mod shell;
 #[cfg(not(loader_test_exec))]
 mod startup;
 use blueos::loader::adapters::{FlatImageAllocation, SliceElfReader};

@@ -23,9 +23,13 @@
 pub mod adapters;
 pub(crate) mod application;
 mod load;
+#[cfg(enable_vfs)]
+mod run;
 mod startup;
 
 pub use adapters::flat_memory::init_fixed_regions;
 pub use application::{Application, ApplicationError, ApplicationExit, ApplicationState};
 pub use load::{board_load_profile, load_image, load_request};
+#[cfg(enable_vfs)]
+pub use run::{run, RunError, RunRequest};
 pub use startup::{StartupArguments, StartupError, StartupStorage};

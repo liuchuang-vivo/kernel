@@ -64,6 +64,7 @@ run_clippy("loader_integration_test_clippy") {
       "//kernel/loader/tests/inputs/runtime_app:runtime_test_app_clippy",
       "//kernel/loader/tests/inputs/startup_app:startup_test_app_clippy",
       "//kernel/loader/tests/inputs/std_app:std_test_app_clippy",
+      "//shell:shell_elf_clippy",
     ]
   }
 }
