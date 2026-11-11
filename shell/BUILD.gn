@@ -62,8 +62,9 @@ if (board_toolchain_info.current_cpu == "riscv32" ||
   }
 }
 
-if (board == "qemu_riscv32" || board == "qemu_riscv64" ||
-    board == "qemu_virt64_aarch64") {
+if (board_toolchain_info.current_cpu == "riscv32" ||
+    board_toolchain_info.current_cpu == "riscv64" ||
+    board_toolchain_info.current_cpu == "aarch64") {
   run_clippy("shell_elf_clippy") {
     deps = [ ":shell_elf" ]
   }
