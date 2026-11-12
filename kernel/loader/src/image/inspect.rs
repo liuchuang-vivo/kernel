@@ -14,14 +14,14 @@
 
 //! Checked program headers and read-only planning of executable image layouts.
 
-use super::{plan::PlannedImage, LoadRequest};
+use super::plan::PlannedImage;
 use crate::{
     elf::{read_dynamic, ElfClass, ElfHeaderInfo, FileRange, LoadSegmentInfo, ProgramHeaderInfo},
     error::{ErrorContext, HeaderField, LoadErrorKind, LoadStage, ProgramHeaderField},
     memory::{MemoryPermissions, TargetAddress, TargetRange},
     profile::LoadPurpose,
     reader::ElfReader,
-    LoadError, LoadResult,
+    LoadError, LoadRequest, LoadResult,
 };
 use alloc::vec::Vec;
 use goblin::elf::program_header::{PT_DYNAMIC, PT_GNU_RELRO, PT_LOAD};
@@ -194,21 +194,21 @@ impl<R: ElfReader> InspectedImage<R> {
             .iter()
             .find(|header| header.r#type() == PT_GNU_RELRO)
             .map(|header| TargetRange::new(header.vaddr(), header.memory_size()));
-        if let Some(relro) = relro {
-            if !segments.iter().any(|segment| {
+        if let Some(relro) = relro
+            && !segments.iter().any(|segment| {
                 segment.permissions().contains(MemoryPermissions::WRITE)
                     && TargetRange::new(segment.vaddr(), segment.memory_size())
                         .contains_span(relro.start(), relro.len())
-            }) {
-                return Err(LoadError::new(
-                    LoadErrorKind::PermissionConflict,
-                    ErrorContext::TargetRange {
-                        start: relro.start(),
-                        len: relro.len(),
-                        align: 0,
-                    },
-                ));
-            }
+            })
+        {
+            return Err(LoadError::new(
+                LoadErrorKind::PermissionConflict,
+                ErrorContext::TargetRange {
+                    start: relro.start(),
+                    len: relro.len(),
+                    align: 0,
+                },
+            ));
         }
         let dynamic_header = self
             .program_headers

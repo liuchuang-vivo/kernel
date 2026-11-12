@@ -16,6 +16,11 @@ import("//build/boards/${board}.gni")
 import("//build/templates/build_template.gni")
 import("//build/toolchain/blueos.gni")
 
+_startup_test_enabled = !defined(loader_test_relocation) &&
+                        (board_toolchain_info.current_cpu == "riscv32" ||
+                         board_toolchain_info.current_cpu == "riscv64" ||
+                         board_toolchain_info.current_cpu == "aarch64")
+
 build_rust("loader_integration_test") {
   testonly = true
   crate_type = "bin"
@@ -23,6 +28,7 @@ build_rust("loader_integration_test") {
   sources = [ "src/test.rs" ]
   deps = [
     "//external/rust:semihosting",
+    "//kernel/header:blueos_header",
     "//kernel/kernel:blueos",
     "//kernel/loader:blueos_loader",
     "//kernel/loader/tests/inputs",
@@ -53,6 +59,14 @@ build_rust("loader_integration_test") {
 run_clippy("loader_integration_test_clippy") {
   testonly = true
   deps = [ ":loader_integration_test" ]
+  if (_startup_test_enabled) {
+    deps += [
+      "//kernel/loader/tests/inputs/runtime_app:runtime_test_app_clippy",
+      "//kernel/loader/tests/inputs/startup_app:startup_test_app_clippy",
+      "//kernel/loader/tests/inputs/std_app:std_test_app_clippy",
+      "//shell:shell_elf_clippy",
+    ]
+  }
 }
 
 if (defined(qemu_use_esp32_loader) && qemu_use_esp32_loader) {

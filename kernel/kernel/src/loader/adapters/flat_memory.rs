@@ -13,32 +13,76 @@
 // limitations under the License.
 
 //! Flat image allocations and their authorized fixed-address regions.
+//!
+//! This is the kernel's host mapping for the flat execution domain: heap
+//! backing for relocatable images, or exclusive use of a declared fixed
+//! region for ET_EXEC images. Permissions are tracked logically; the flat
+//! model does not reprogram page tables or MPU regions.
 
 use alloc::vec::Vec;
 use blueos_infra::storage::Storage;
+use blueos_loader::{
+    error::{ErrorContext, LoadErrorKind},
+    memory::{
+        AllocationOffset, ImageAllocator, ImageLayout, ImageMapping, MemoryPermissions, Placement,
+        ProtectionLevel, TargetAddress,
+    },
+    LoadError, LoadResult,
+};
 use core::{
     alloc::Layout,
     sync::atomic::{AtomicBool, Ordering},
 };
+use spin::Once;
 
-use crate::{
-    error::{ErrorContext, LoadErrorKind},
-    memory::{
-        AllocationOffset, ImageAllocator, ImageLayout, ImageMapping, MemoryPermissions, Placement,
-        ProtectionLevel, ProtectionRange, TargetAddress,
-    },
-    LoadError, LoadResult,
-};
+/// A nonempty permission range relative to the image allocation base.
+///
+/// Backends may use these records to track their current access rules.
+/// Updating a mapping only requires the interval passed to `set_permissions`.
+/// NONE spans need not have physical backing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProtectionRange {
+    allocation_offset: AllocationOffset,
+    len: u64,
+    permissions: MemoryPermissions,
+}
+
+impl ProtectionRange {
+    const fn new(
+        allocation_offset: AllocationOffset,
+        len: u64,
+        permissions: MemoryPermissions,
+    ) -> Self {
+        Self {
+            allocation_offset,
+            len,
+            permissions,
+        }
+    }
+
+    const fn allocation_offset(&self) -> AllocationOffset {
+        self.allocation_offset
+    }
+
+    const fn len(&self) -> u64 {
+        self.len
+    }
+
+    const fn permissions(&self) -> MemoryPermissions {
+        self.permissions
+    }
+}
 
 /// A fixed address range authorized for the flat memory backend.
 ///
 /// The shared occupancy flag prevents overlapping allocations from reusing the
 /// same region, including allocations prepared by different mapper instances.
+/// Production mappings use the single table installed by `init_fixed_regions`.
 #[derive(Debug)]
 pub struct MemoryRegion {
-    pub(crate) start: usize,
-    pub(crate) end: usize,
-    pub(crate) permissions: MemoryPermissions,
+    start: usize,
+    end: usize,
+    permissions: MemoryPermissions,
     occupied: AtomicBool,
 }
 
@@ -50,8 +94,9 @@ impl MemoryRegion {
     /// `[start, end)` must remain valid and mapped for the advertised permissions
     /// for every mapper and allocation using it. The caller must prevent aliasing
     /// Rust references, execution, and conflicting accesses while it is borrowed.
-    /// Overlapping region declarations and legacy mappers must not bypass that
-    /// exclusivity; only allocations using this same declaration share its flag.
+    /// The storage must be reserved independently of this descriptor: it must
+    /// not overlap live kernel objects or be available to another allocator.
+    /// This constructor declares access; it does not reserve physical storage.
     pub const unsafe fn new(start: usize, end: usize, permissions: MemoryPermissions) -> Self {
         Self {
             start,
@@ -60,6 +105,51 @@ impl MemoryRegion {
             occupied: AtomicBool::new(false),
         }
     }
+}
+
+static FIXED_REGIONS: Once<&'static [MemoryRegion]> = Once::new();
+
+/// Install the platform's fixed image regions before creating loaders.
+///
+/// The complete table is checked for empty/inverted and overlapping ranges
+/// before publication. All loaders share the same descriptors and occupancy
+/// flags. Reinstalling this exact table is harmless; replacing it is rejected.
+/// With no table installed, loaders support heap placement only.
+///
+/// The platform must provide the reserved storage promised by `MemoryRegion`;
+/// neither the kernel nor the loader checks for overlap with the heap or static
+/// objects, or reserves this storage against other users.
+pub fn init_fixed_regions(regions: &'static [MemoryRegion]) -> LoadResult<()> {
+    validate_regions(regions)?;
+    let installed = FIXED_REGIONS.call_once(|| regions);
+    if core::ptr::eq(*installed, regions) {
+        Ok(())
+    } else {
+        Err(LoadError::new(
+            LoadErrorKind::PermissionConflict,
+            ErrorContext::None,
+        ))
+    }
+}
+
+fn validate_regions(regions: &[MemoryRegion]) -> LoadResult<()> {
+    for (index, region) in regions.iter().enumerate() {
+        if region.start >= region.end
+            || regions[..index]
+                .iter()
+                .any(|previous| region.start < previous.end && previous.start < region.end)
+        {
+            return Err(LoadError::new(
+                LoadErrorKind::IncorrectLayout,
+                ErrorContext::TargetRange {
+                    start: TargetAddress::new(region.start as u64),
+                    len: region.end.saturating_sub(region.start) as u64,
+                    align: 1,
+                },
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Prepares heap-backed images or borrows an authorized fixed region.
@@ -74,10 +164,12 @@ pub struct MemoryMapper {
 }
 
 impl MemoryMapper {
+    /// Use the platform's shared fixed regions, plus ordinary heap placement.
+    /// Initialize the platform table before creating mappers that need it.
     #[inline]
-    pub fn new(regions: Option<&'static [MemoryRegion]>) -> Self {
+    pub fn new() -> Self {
         Self {
-            regions: regions.unwrap_or(&[]),
+            regions: FIXED_REGIONS.get().copied().unwrap_or(&[]),
         }
     }
 
@@ -319,10 +411,10 @@ impl ImageMapping for FlatImageAllocation {
         if len == 0 {
             return Ok(());
         }
-        if let FlatBacking::Fixed(region) = &self.backing {
-            if !region.permissions.contains(permissions) {
-                return Err(fail(LoadErrorKind::PermissionConflict));
-            }
+        if let FlatBacking::Fixed(region) = &self.backing
+            && !region.permissions.contains(permissions)
+        {
+            return Err(fail(LoadErrorKind::PermissionConflict));
         }
 
         let previous = &self.protection;
@@ -377,17 +469,16 @@ fn append_protection(
     len: u64,
     permissions: MemoryPermissions,
 ) {
-    if let Some(previous) = ranges.last_mut() {
-        if previous.permissions() == permissions
-            && previous.allocation_offset().value() + previous.len() == start
-        {
-            *previous = ProtectionRange::new(
-                previous.allocation_offset(),
-                previous.len() + len,
-                permissions,
-            );
-            return;
-        }
+    if let Some(previous) = ranges.last_mut()
+        && previous.permissions() == permissions
+        && previous.allocation_offset().value() + previous.len() == start
+    {
+        *previous = ProtectionRange::new(
+            previous.allocation_offset(),
+            previous.len() + len,
+            permissions,
+        );
+        return;
     }
     ranges.push(ProtectionRange::new(
         AllocationOffset::new(start),

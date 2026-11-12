@@ -256,11 +256,16 @@ fn cleanup_retired_thread(old: &mut ThreadNode) {
     if ThreadNode::strong_count(old) != 1 {
         // TODO: Add warning log that there are still references to the old thread.
     }
-    if let Some(entry) = old.lock().take_cleanup() {
-        match entry {
-            Entry::C(f) => f(),
-            Entry::Closure(f) => f(),
-            Entry::Posix(f, arg) => f(arg),
+    // End the Thread lock before either executing or posting the callback.
+    let cleanup = old.lock().take_cleanup();
+    if let Some(cleanup) = cleanup {
+        match cleanup {
+            thread::Cleanup::Deferred(cleanup) => thread::post_deferred_cleanup(cleanup),
+            thread::Cleanup::Inline(entry) => match entry {
+                Entry::C(f) => f(),
+                Entry::Closure(f) => f(),
+                Entry::Posix(f, arg) => f(arg),
+            },
         }
     };
 }

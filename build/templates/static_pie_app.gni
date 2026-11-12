@@ -1,0 +1,68 @@
+# Copyright (c) 2026 vivo Mobile Communication Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import("//build/templates/rust.gni")
+
+# Self-contained native ELF application, relocated by load_elf before entry.
+# Link librs statically and supply its standard initial-stack CRT; no
+# interpreter, shared libc or kernel runtime is linked. The Rust root must use
+# `extern crate librs;` so rustc includes the libc implementation. Ordinary Rust
+# fn main() uses std's allocator/panic runtime; no_std applications supply their
+# own.
+template("static_pie_app") {
+  assert(defined(invoker.sources), "static_pie_app requires sources")
+  assert(!defined(invoker.linker_script),
+         "static_pie_app does not use a fixed-address kernel linker script")
+  assert(board_toolchain_info.current_cpu == "riscv32" ||
+             board_toolchain_info.current_cpu == "riscv64" ||
+             board_toolchain_info.current_cpu == "aarch64",
+         "static_pie_app requires a supported native loader profile")
+
+  build_rust(target_name) {
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "deps",
+                             "rustflags",
+                           ])
+    crate_type = "bin"
+    if (!defined(configs)) {
+      configs = []
+    }
+    configs += [ "//build/boards/${board}:app_config" ]
+    deps = [
+      "//libs/librs:crt1",
+      "//libs/librs:librs_swi",
+    ]
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+    rustflags = [
+      "-Cpanic=abort",
+      "-Crelocation-model=pic",
+      "-Clink-arg=-nostartfiles",
+      "-Clink-arg=-Wl,-static",
+      "-Clink-arg=-Wl,-pie",
+      "-Clink-arg=-Wl,--no-dynamic-linker",
+
+      # Pull _start from the CRT archive even though no object calls it.
+      "-Clink-arg=-Wl,-u,_start",
+      "-Clink-arg=-Wl,-e,_start",
+      "-Clink-arg=-Wl,-z,noexecstack",
+    ]
+    if (defined(invoker.rustflags)) {
+      rustflags += invoker.rustflags
+    }
+  }
+}

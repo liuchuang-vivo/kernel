@@ -14,14 +14,17 @@
 
 //! Read-only layout, resource bounds, permission policy and reader ownership.
 
-use super::fixture::{ElfFixtureBuilder, ProgramHeaderFixture, SliceElfReader};
+use super::{
+    fixture::{ElfFixtureBuilder, ProgramHeaderFixture},
+    support::SliceElfReader,
+};
 use crate::{
     error::{ErrorContext, HeaderField, LimitKind, LoadErrorKind, LoadStage, ProgramHeaderField},
-    image::{ImageLoader, LoadRequest, PlannedImage},
+    image::{ImageLoader, PlannedImage},
     memory::{MemoryPermissions, TargetAddress},
     profile::{ElfClass, ElfMachine, LoadLimits, LoadProfile, SegmentPermissionPolicy},
     reader::ElfReader,
-    LoadError, LoadResult,
+    LoadError, LoadRequest, LoadResult,
 };
 use blueos_test_macro::test;
 use core::cell::Cell;
@@ -362,7 +365,16 @@ fn planning_budgets_include_holes_and_alignment_padding() {
                 ..ProgramHeaderFixture::load()
             })
             .build();
-        let limits = LoadLimits::new(64 * 1024 * 1024, 128, 32, 0x3000, 0x1000, 1024, 64 * 1024);
+        let limits = LoadLimits::new(
+            64 * 1024 * 1024,
+            128,
+            32,
+            0x3000,
+            0x1000,
+            1024,
+            64 * 1024,
+            1024,
+        );
         assert_eq!(LoadLimits::DEFAULT, LoadLimits::default());
         assert_eq!(
             plan(&bytes, profile, limits).unwrap().image_range().len(),

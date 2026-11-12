@@ -13,7 +13,7 @@
 // limitations under the License.
 
 pub fn command(args: &[&str]) -> Result<(), String> {
-    if args.len() < 1 {
+    if args.is_empty() {
         return Err("Invalid args".to_string());
     }
     let ptr: usize = if args[0].starts_with("0x") {

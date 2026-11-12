@@ -45,6 +45,9 @@ use core::{
 
 mod builder;
 pub use builder::*;
+mod deferred;
+pub(crate) use deferred::post as post_deferred_cleanup;
+pub use deferred::{CleanupError, DeferredCleanup};
 
 pub type ThreadNode = Arc<Thread>;
 
@@ -63,6 +66,14 @@ impl core::fmt::Debug for Entry {
     }
 }
 
+/// Select whether retirement executes a callback inline or posts it to a worker.
+#[derive(Debug)]
+#[must_use = "retain the callback until retirement or explicitly execute it"]
+pub enum Cleanup {
+    Inline(Entry),
+    Deferred(DeferredCleanup),
+}
+
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub enum ThreadKind {
     AsyncPoller,
@@ -74,17 +85,23 @@ pub enum ThreadKind {
 }
 
 #[derive(Debug)]
-pub struct Stack(Storage);
+#[must_use = "retain the stack until its execution and payload accesses finish"]
+pub struct Stack {
+    storage: Storage,
+    usable_len: usize,
+}
 
 impl Stack {
+    /// End of the execution stack. Reserved startup data may follow it in
+    /// the same allocation and remains owned by this stack.
     #[inline]
     pub fn top(&self) -> *mut u8 {
-        unsafe { self.0.base().add(self.size()) }
+        unsafe { self.storage.base().add(self.size()) }
     }
 
     #[inline]
     pub fn base(&self) -> *mut u8 {
-        self.0.base()
+        self.storage.base()
     }
 
     #[inline]
@@ -98,11 +115,17 @@ impl Stack {
         if storage.base().is_null() {
             return None;
         }
-        Some(Self(storage))
+        Some(Self {
+            storage,
+            usable_len: size,
+        })
     }
 
     pub const fn new() -> Self {
-        Self(Storage::new())
+        Self {
+            storage: Storage::new(),
+            usable_len: 0,
+        }
     }
 
     #[inline]
@@ -117,11 +140,29 @@ impl Stack {
         if !(base as usize).is_multiple_of(ALIGN) {
             return None;
         }
-        Some(Self(unsafe { Storage::from_raw(base, size) }))
+        Some(Self {
+            storage: unsafe { Storage::from_raw(base, size) },
+            usable_len: size,
+        })
     }
 
+    /// Execution-stack length, excluding any reserved startup payload.
     pub fn size(&self) -> usize {
-        self.0.size()
+        self.usable_len
+    }
+
+    /// Reserve a payload above the execution stack, retaining the original
+    /// allocation and deallocation layout. Thread::init uses the reduced top,
+    /// so its context and bootstrap frames cannot overwrite the payload.
+    pub(crate) fn reserve_top(&mut self, bytes: usize) -> Option<*mut u8> {
+        let len = self.usable_len.checked_sub(bytes)?;
+        if len < core::mem::size_of::<Context>() + core::mem::align_of::<Context>()
+            || !(self.base().addr() + len).is_multiple_of(core::mem::align_of::<Context>())
+        {
+            return None;
+        }
+        self.usable_len = len;
+        Some(self.top())
     }
 }
 
@@ -204,7 +245,7 @@ pub struct Thread {
     global: GlobalQueueListHead,
     sched_node: IlistHead<Thread, OffsetOfSchedNode>,
     // Cleanup function will be invoked when retiring.
-    cleanup: Option<Entry>,
+    cleanup: Option<Cleanup>,
     kind: ThreadKind,
     // Thread owns Stack::Alloc. It calls dealloc when dropping its self.
     stack: Stack,
@@ -434,13 +475,20 @@ impl Thread {
     }
 
     #[inline]
-    pub fn take_cleanup(&mut self) -> Option<Entry> {
+    pub fn take_cleanup(&mut self) -> Option<Cleanup> {
         self.cleanup.take()
     }
 
     #[inline]
     pub fn set_cleanup(&mut self, cleanup: Entry) {
-        self.cleanup = Some(cleanup);
+        self.cleanup = Some(Cleanup::Inline(cleanup));
+    }
+
+    /// Install a prepared callback for ordinary worker execution at retirement.
+    /// Prepare it with DeferredCleanup::new outside this thread's lock. The
+    /// worker does not inherit this thread's Process or fd table.
+    pub fn set_deferred_cleanup(&mut self, cleanup: DeferredCleanup) {
+        self.cleanup = Some(Cleanup::Deferred(cleanup));
     }
 
     #[inline]
@@ -640,7 +688,7 @@ impl Thread {
     }
 
     /// High address
-    /// ------------------------------ <--- stack.top() == allocated buffer end
+    /// ------------------------------ <--- stack.top() (below any reserved payload)
     /// | optional align gap (0..A)  |
     /// ------------------------------
     /// | Context for current thread |

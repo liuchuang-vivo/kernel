@@ -62,6 +62,10 @@ pub(crate) unsafe extern "C" fn trap_entry() {
             rv_save_context_prologue!(),
             rv_save_context!(),
             "
+            .option push
+            .option norelax
+            la gp, __global_pointer$
+            .option pop
             mv s1, sp
             csrr s2, mcause
             csrr s3, mtval

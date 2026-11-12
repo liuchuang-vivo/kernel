@@ -7,16 +7,26 @@
 #![feature(custom_test_frameworks)]
 #![test_runner(loader_test_runner)]
 #![reexport_test_harness_main = "loader_test_main"]
-#![feature(c_size_t)]
-#![feature(thread_local)]
-#![feature(c_variadic)]
 
 extern crate alloc;
 extern crate rsrt;
+
+mod runner;
+#[cfg(all(not(loader_test_exec), enable_vfs))]
+mod shell;
+#[cfg(not(loader_test_exec))]
+mod startup;
+use blueos::loader::adapters::{FlatImageAllocation, SliceElfReader};
+#[cfg(enable_vfs)]
+use blueos::{loader::adapters::VfsElfReader, vfs::FileOps};
+use runner::FileReader;
 // Import it just for the global allocator.
-use alloc::vec::Vec;
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use blueos_loader as loader;
-use core::ffi::c_char;
+use core::{
+    ffi::{c_char, CStr},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 use librs::pthread;
 use semihosting::{io::Read, println};
 
@@ -27,64 +37,15 @@ unsafe extern "C" {
     static INVALID_SEGMENT_SIZE_ELF_PATH: *const c_char;
 }
 
-#[cfg(loader_test_exec)]
-mod loader_test_config {
-    use blueos_loader as loader;
-
-    const fn parse_hex(value: &str) -> usize {
-        let bytes = value.as_bytes();
-        if bytes.len() <= 2 || bytes[0] != b'0' || (bytes[1] != b'x' && bytes[1] != b'X') {
-            panic!("loader test relocation value must be hexadecimal");
-        }
-
-        let mut index = 2;
-        let mut result = 0usize;
-        while index < bytes.len() {
-            let digit = match bytes[index] {
-                b'0'..=b'9' => (bytes[index] - b'0') as usize,
-                b'a'..=b'f' => (bytes[index] - b'a' + 10) as usize,
-                b'A'..=b'F' => (bytes[index] - b'A' + 10) as usize,
-                _ => panic!("invalid loader test relocation hex value"),
-            };
-            result = result * 16 + digit;
-            index += 1;
-        }
-        result
-    }
-
-    const fn parse_permissions(value: &str) -> loader::MemoryPermissions {
-        let bytes = value.as_bytes();
-        let mut index = 0;
-        let mut permissions = loader::MemoryPermissions::NONE;
-        while index < bytes.len() {
-            let permission = match bytes[index] {
-                b'r' => loader::MemoryPermissions::READ,
-                b'w' => loader::MemoryPermissions::WRITE,
-                b'x' => loader::MemoryPermissions::EXECUTE,
-                _ => panic!("invalid loader test relocation permission"),
-            };
-            permissions = permissions.bitor(permission);
-            index += 1;
-        }
-        permissions
-    }
-
-    pub const TEST_REGION_START: usize = parse_hex(env!("LOADER_TEST_RELOCATION_ORIGIN"));
-    pub const TEST_REGION_END: usize =
-        TEST_REGION_START + parse_hex(env!("LOADER_TEST_RELOCATION_LENGTH"));
-    pub const TEST_REGION_PERMISSIONS: loader::MemoryPermissions =
-        parse_permissions(env!("LOADER_TEST_RELOCATION_PERMISSIONS"));
-
-    pub static TEST_REGIONS: [loader::MemoryRegion; 1] = [unsafe {
-        loader::MemoryRegion::new(TEST_REGION_START, TEST_REGION_END, TEST_REGION_PERMISSIONS)
-    }];
-}
-
 fn read_all(ptr: *const core::ffi::c_char) -> semihosting::io::Result<Vec<u8>> {
     let path = unsafe { core::ffi::CStr::from_ptr(ptr) };
     let mut file = semihosting::fs::File::open(path)?;
+    // Debug fixtures are several MiB and the boards' heap is small, so size
+    // the buffer up front: growing it would hold the old and new blocks at
+    // once.
+    let len = usize::try_from(file.metadata()?.len()).unwrap_or(0);
+    let mut buf = Vec::with_capacity(len);
     let mut tmp = [0u8; 64];
-    let mut buf = Vec::new();
     loop {
         let size = file.read(&mut tmp)?;
         if size == 0 {
@@ -97,136 +58,262 @@ fn read_all(ptr: *const core::ffi::c_char) -> semihosting::io::Result<Vec<u8>> {
 
 mod test_elf_loader {
     #[cfg(loader_test_exec)]
-    use super::loader_test_config::{
-        TEST_REGIONS, TEST_REGION_END, TEST_REGION_PERMISSIONS, TEST_REGION_START,
-    };
+    use super::runner::fixed::{TEST_REGION_END, TEST_REGION_START};
     use super::*;
     use blueos_test_macro::test;
 
     #[cfg(loader_test_exec)]
     const EXPECTED_RESULT: u32 = 0x9afc_e987;
 
-    #[cfg(loader_test_exec)]
-    static SHORT_REGIONS: [loader::MemoryRegion; 1] = [unsafe {
-        // SAFETY: This is a valid subset of the configured loader test range.
-        loader::MemoryRegion::new(
-            TEST_REGION_START,
-            TEST_REGION_START + 16,
-            TEST_REGION_PERMISSIONS,
-        )
-    }];
-
-    #[cfg(loader_test_exec)]
-    static NON_EXEC_REGIONS: [loader::MemoryRegion; 1] = [unsafe {
-        // SAFETY: The configured region supports read and write accesses.
-        loader::MemoryRegion::new(
-            TEST_REGION_START,
-            TEST_REGION_END,
-            loader::MemoryPermissions::READ.bitor(loader::MemoryPermissions::WRITE),
-        )
-    }];
-
-    fn new_mapper() -> loader::MemoryMapper {
+    fn run(image: &loader::LoadedImage<FlatImageAllocation>) {
+        // These fixtures do not define runtime lifecycle hooks.
+        assert!(image.lifecycle().preinit().is_empty());
+        assert!(image.lifecycle().init().is_empty());
+        assert!(image.lifecycle().fini().is_empty());
+        let entry = usize::try_from(image.entry().expect("application entry").get()).unwrap();
         #[cfg(loader_test_exec)]
         {
-            loader::MemoryMapper::new(Some(&TEST_REGIONS))
+            // SAFETY: the configured fixture declares a synchronous C entry
+            // returning u32; image and the pinned cache context remain alive.
+            let function: extern "C" fn() -> u32 = unsafe { core::mem::transmute(entry) };
+            assert_eq!(function(), EXPECTED_RESULT);
         }
         #[cfg(not(loader_test_exec))]
         {
-            loader::MemoryMapper::new(None)
+            // SAFETY: the PIC fixture declares a synchronous C fn() entry;
+            // image retains its initialized backing in the local cache context.
+            let function: extern "C" fn() = unsafe { core::mem::transmute(entry) };
+            function();
         }
     }
 
-    // FIXME: The PIC ELF file is too large in debug mode. We should use
-    // lseek to parse the ELF file.
-    // TODO(paging): Re-enable once executable page allocation is supported and
-    // the loader uses it; ordinary heap allocations must remain non-executable.
+    // The release-only slice case retains the complete file, including debug
+    // sections. The positional reader case below also runs in debug builds.
+    // TODO(paging): Re-enable once the loader uses executable page allocations;
+    // ordinary heap allocations must remain non-executable.
     #[cfg(all(not(debug_assertions), not(paging)))]
     #[test]
     fn test_load_elf_and_run() {
-        let buf = read_all(unsafe { LOADER_TEST_ELF_PATH }).unwrap();
-        let mut mapper = new_mapper();
-        assert!(loader::load_elf(&buf, &mut mapper).is_ok());
-        let entry = mapper.real_entry().unwrap();
-
-        #[cfg(loader_test_exec)]
-        {
-            let run = unsafe { core::mem::transmute::<usize, extern "C" fn() -> u32>(entry) };
-            assert_eq!(run(), EXPECTED_RESULT);
-        }
-        #[cfg(not(loader_test_exec))]
-        {
-            // SAFETY: the fixture's _start uses the C ABI, and mapper retains
-            // its loaded backing until after this call.
-            let run = unsafe { core::mem::transmute::<usize, extern "C" fn()>(entry) };
-            run();
-        }
+        let bytes = read_all(unsafe { LOADER_TEST_ELF_PATH }).unwrap();
+        let _pinned = blueos::support::DisableInterruptGuard::new();
+        let image =
+            blueos::loader::load_image(SliceElfReader::new(&bytes)).expect("load ELF from memory");
+        run(&image);
     }
 
-    // FIXME: We should use FS's lseek API to get lower footprint.
-    // TODO: Use semihosting's seek API to parse the ELF file.
-    #[cfg(not(loader_test_exec))]
+    // A direct RTOS thread without a Process uses the kernel's production
+    // reader, flat allocator and cache backend. Loading and handing off the
+    // image must not depend on Process/VFS state. Both ELF types go through
+    // the same entry; fixed fixtures use the shared platform table.
     #[test]
-    fn test_seek_and_parse_elf() {}
+    fn test_load_elf_in_unowned_rtos_thread() {
+        let bytes = read_all(unsafe { LOADER_TEST_ELF_PATH }).unwrap();
+        run_in_unowned_thread(move || {
+            let _pinned = blueos::support::DisableInterruptGuard::new();
+            let image = blueos::loader::load_image(SliceElfReader::new(&bytes))
+                .expect("load ELF in an unowned RTOS thread");
+            run(&image);
+        });
+    }
 
-    #[cfg(not(debug_assertions))]
+    fn run_in_unowned_thread(work: impl FnOnce() + Send + 'static) {
+        let done = Arc::new(AtomicUsize::new(0));
+        let loaded = Arc::new(AtomicBool::new(false));
+        let done_w = done.clone();
+        let loaded_w = loaded.clone();
+        // The default thread stack is too small for ELF inspection on 32-bit
+        // release builds; the load runs in a thread with the app stack size.
+        let stack = blueos::thread::Stack::from_size(16 << 10).expect("loader test stack");
+        let mut t =
+            blueos::thread::Builder::new(blueos::thread::Entry::Closure(Box::new(move || {
+                assert!(blueos::process::current_process().is_none());
+                work();
+                loaded_w.store(true, Ordering::Release);
+                // Return normally: run_closure releases this closure and its
+                // captures before retiring the thread.
+            })))
+            .set_stack(stack)
+            .build();
+        assert!(t.process().is_none());
+        // This hook runs after the entry closure and its captures are dropped.
+        t.lock()
+            .set_cleanup(blueos::thread::Entry::Closure(Box::new(move || {
+                done_w.store(1, Ordering::Release);
+                blueos::sync::wake(&done_w);
+            })));
+        assert_eq!(
+            blueos::scheduler::queue_ready_thread(blueos::thread::IDLE, t),
+            Ok(())
+        );
+        blueos::sync::wait_until(1, &done);
+        assert!(loaded.load(Ordering::Acquire));
+        assert_eq!(Arc::strong_count(&loaded), 1);
+    }
+
+    #[cfg(enable_vfs)]
+    #[test]
+    fn test_load_elf_from_vfs_in_unowned_rtos_thread() {
+        const PATH: &str = "/loader-vfs-test.elf";
+        // Copy the host fixture into target tmpfs in small chunks. The ELF
+        // reader under test then reads the target file directly, without
+        // keeping a second complete input buffer or allocating a descriptor.
+        let mut source =
+            semihosting::fs::File::open(unsafe { CStr::from_ptr(LOADER_TEST_ELF_PATH) })
+                .expect("open host ELF fixture");
+        let file =
+            blueos::vfs::open_path(PATH, libc::O_CREAT | libc::O_TRUNC | libc::O_WRONLY, 0o600)
+                .expect("create target ELF file");
+        let len = usize::try_from(source.metadata().unwrap().len()).unwrap();
+        file.resize(len).expect("size target file before copying");
+        let mut copied = 0;
+        let mut buffer = [0; 512];
+        loop {
+            let count = source.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            let mut written = 0;
+            while written < count {
+                let size = file.write(&buffer[written..count]).unwrap();
+                assert!(size != 0);
+                written += size;
+            }
+            copied += count;
+        }
+        assert_eq!(copied, len);
+        drop(file);
+        drop(source);
+
+        run_in_unowned_thread(|| {
+            let file = blueos::vfs::open_path(PATH, libc::O_RDONLY, 0)
+                .expect("open target ELF without a process or fd");
+            let reader = VfsElfReader::new(file).expect("readable regular ELF file");
+            // This tmpfs file is resident and has no concurrent users. Keep
+            // local cache publication and fixture execution on this CPU.
+            let _pinned = blueos::support::DisableInterruptGuard::new();
+            let image = blueos::loader::load_image(reader).expect("load ELF from target VFS");
+            run(&image);
+        });
+        assert_eq!(
+            blueos::vfs::syscalls::unlink(c"/loader-vfs-test.elf".as_ptr()),
+            0
+        );
+    }
+
+    #[test]
+    fn test_load_elf_from_file_and_run() {
+        let input = open(unsafe { LOADER_TEST_ELF_PATH });
+        let _pinned = blueos::support::DisableInterruptGuard::new();
+        let image =
+            blueos::loader::load_image(input).expect("load ELF through positional file reads");
+        run(&image);
+    }
+
+    fn open(ptr: *const c_char) -> FileReader {
+        // SAFETY: the linker-generated test symbols point to live NUL-terminated paths.
+        FileReader::open(unsafe { CStr::from_ptr(ptr) }).expect("open ELF fixture")
+    }
+
     #[test]
     fn test_invalid_entry() {
-        let res = read_all(unsafe { INVALID_ENTRY_ELF_PATH });
-        assert!(res.is_ok());
-        let buf = res.unwrap();
-        let mut mapper = new_mapper();
-        let res = loader::load_elf(buf.as_slice(), &mut mapper);
-        assert!(res.is_err());
+        let input = open(unsafe { INVALID_ENTRY_ELF_PATH });
+        let _pinned = blueos::support::DisableInterruptGuard::new();
+        assert!(blueos::loader::load_image(input).is_err());
     }
 
-    #[cfg(not(debug_assertions))]
     #[test]
     fn test_invalid_magic() {
-        let res = read_all(unsafe { INVALID_MAGIC_ELF_PATH });
-        assert!(res.is_ok());
-        let buf = res.unwrap();
-        let mut mapper = new_mapper();
-        let res = loader::load_elf(buf.as_slice(), &mut mapper);
-        assert!(res.is_err());
+        let input = open(unsafe { INVALID_MAGIC_ELF_PATH });
+        let _pinned = blueos::support::DisableInterruptGuard::new();
+        assert!(blueos::loader::load_image(input).is_err());
     }
 
-    #[cfg(not(debug_assertions))]
     #[test]
     fn test_invalid_segment_size() {
-        let res = read_all(unsafe { INVALID_SEGMENT_SIZE_ELF_PATH });
-        assert!(res.is_ok());
-        let buf = res.unwrap();
-        let mut mapper = new_mapper();
-        let res = loader::load_elf(buf.as_slice(), &mut mapper);
-        assert!(res.is_err());
+        let input = open(unsafe { INVALID_SEGMENT_SIZE_ELF_PATH });
+        let _pinned = blueos::support::DisableInterruptGuard::new();
+        assert!(blueos::loader::load_image(input).is_err());
+    }
+
+    // These fixed fixtures are ELF32 little-endian images produced by exec_app.
+    #[cfg(loader_test_exec)]
+    fn exec_word(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    #[cfg(loader_test_exec)]
+    fn set_exec_word(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[cfg(loader_test_exec)]
+    fn exec_load_headers(bytes: &[u8]) -> Vec<usize> {
+        assert_eq!(bytes[4], 1);
+        assert_eq!(bytes[5], 1);
+        let start = exec_word(bytes, 28) as usize;
+        let stride = u16::from_le_bytes(bytes[42..44].try_into().unwrap()) as usize;
+        let count = u16::from_le_bytes(bytes[44..46].try_into().unwrap()) as usize;
+        (0..count)
+            .map(|index| start + index * stride)
+            .filter(|&offset| exec_word(bytes, offset) == 1)
+            .collect()
     }
 
     #[cfg(loader_test_exec)]
     #[test]
-    fn test_exec_rejects_allocated_mapper() {
-        let buf = read_all(unsafe { LOADER_TEST_ELF_PATH }).unwrap();
-        let mut mapper = loader::MemoryMapper::new(None);
-        assert!(loader::load_elf(&buf, &mut mapper).is_err());
+    fn test_exec_rejects_unregistered_addresses() {
+        let mut bytes = read_all(unsafe { LOADER_TEST_ELF_PATH }).unwrap();
+        let delta = u32::try_from(TEST_REGION_END - TEST_REGION_START).unwrap();
+        let entry = exec_word(&bytes, 24).checked_add(delta).unwrap();
+        set_exec_word(&mut bytes, 24, entry);
+        for header in exec_load_headers(&bytes) {
+            for field in [8, 12] {
+                let value = exec_word(&bytes, header + field)
+                    .checked_add(delta)
+                    .unwrap();
+                set_exec_word(&mut bytes, header + field, value);
+            }
+        }
+        let error = blueos::loader::load_image(SliceElfReader::new(&bytes))
+            .err()
+            .expect("unregistered placement must fail");
+        assert_eq!(error.stage(), Some(loader::error::LoadStage::Allocate));
+        assert_eq!(error.kind(), loader::error::LoadErrorKind::OutOfBounds);
     }
 
     #[cfg(loader_test_exec)]
     #[test]
     fn test_exec_rejects_out_of_range_without_writing() {
-        let buf = read_all(unsafe { LOADER_TEST_ELF_PATH }).unwrap();
+        let mut bytes = read_all(unsafe { LOADER_TEST_ELF_PATH }).unwrap();
+        let header = *exec_load_headers(&bytes).last().unwrap();
+        let size = exec_word(&bytes, header + 20)
+            .checked_add(u32::try_from(TEST_REGION_END - TEST_REGION_START).unwrap())
+            .unwrap();
+        set_exec_word(&mut bytes, header + 20, size);
         let before = unsafe { (TEST_REGION_START as *const u32).read_volatile() };
-        let mut mapper = loader::MemoryMapper::new(Some(&SHORT_REGIONS));
-        assert!(loader::load_elf(&buf, &mut mapper).is_err());
+        let error = blueos::loader::load_image(SliceElfReader::new(&bytes))
+            .err()
+            .expect("crossing the window boundary must fail");
+        assert_eq!(error.stage(), Some(loader::error::LoadStage::Allocate));
+        assert_eq!(error.kind(), loader::error::LoadErrorKind::OutOfBounds);
         let after = unsafe { (TEST_REGION_START as *const u32).read_volatile() };
         assert_eq!(after, before);
     }
 
     #[cfg(loader_test_exec)]
     #[test]
-    fn test_exec_rejects_non_executable_region() {
-        let buf = read_all(unsafe { LOADER_TEST_ELF_PATH }).unwrap();
-        let mut mapper = loader::MemoryMapper::new(Some(&NON_EXEC_REGIONS));
-        assert!(loader::load_elf(&buf, &mut mapper).is_err());
+    fn test_exec_releases_fixed_region_after_image_drop() {
+        let bytes = read_all(unsafe { LOADER_TEST_ELF_PATH }).unwrap();
+        let _pinned = blueos::support::DisableInterruptGuard::new();
+        let image =
+            blueos::loader::load_image(SliceElfReader::new(&bytes)).expect("first fixed mapping");
+        run(&image);
+        blueos::loader::init_fixed_regions(&runner::fixed::TEST_REGIONS).unwrap();
+        assert!(blueos::loader::load_image(SliceElfReader::new(&bytes)).is_err());
+        drop(image);
+        let image = blueos::loader::load_image(SliceElfReader::new(&bytes))
+            .expect("fixed region released and prepared again");
+        run(&image);
     }
 }
 #[unsafe(no_mangle)]
@@ -241,6 +328,9 @@ pub fn loader_test_runner(tests: &[&dyn Fn()]) {
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i32 {
     pthread::register_my_posix_tcb();
+    #[cfg(loader_test_exec)]
+    blueos::loader::init_fixed_regions(&runner::fixed::TEST_REGIONS)
+        .expect("validate and install the platform EXEC window");
     loader_test_main();
     #[cfg(coverage)]
     common_cov::write_coverage_data();

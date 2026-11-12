@@ -45,7 +45,7 @@ unsafe impl GlobalAlloc for PosixAllocator {
         }
 
         let mut mem_ptr: *mut c_void = ptr::null_mut();
-        let align = layout.align();
+        let align = layout.align().max(core::mem::size_of::<*mut c_void>());
         let size = layout.size();
 
         let result = unsafe {
@@ -85,7 +85,7 @@ pub extern "C" fn _start() {
     // Also libcore, liballoc should be built with -fpic
     // enabled. Currently non-riscv targets just passes the test by
     // luck.
-    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+    #[cfg(not(target_arch = "arm"))]
     assert_eq!(main(42), 42);
 }
 #[unsafe(no_mangle)]

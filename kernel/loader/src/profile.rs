@@ -414,6 +414,20 @@ impl LoadProfile {
         Ok(())
     }
 
+    /// Standalone loading cannot obtain providers for declared dependencies.
+    pub(crate) fn check_standalone_dynamic(&self, dynamic: &DynamicInfo) -> LoadResult<()> {
+        if let Some(value) = dynamic.needed().next() {
+            return Err(LoadError::new(
+                LoadErrorKind::UnsupportedByProfile,
+                ErrorContext::DynamicTag {
+                    tag: DT_NEEDED,
+                    value,
+                },
+            ));
+        }
+        Ok(())
+    }
+
     /// Reject runtime semantics not provided by the selected loading profile.
     pub(crate) fn check_dynamic_image(
         &self,
@@ -429,6 +443,17 @@ impl LoadProfile {
                 ErrorContext::DynamicTag {
                     tag: DT_FLAGS_1,
                     value: dynamic.value(DT_FLAGS_1).unwrap_or(0),
+                },
+            ));
+        }
+        if purpose == LoadPurpose::SharedObject
+            && let Some(value) = dynamic.value(DT_PREINIT_ARRAY)
+        {
+            return Err(LoadError::new(
+                LoadErrorKind::UnsupportedByProfile,
+                ErrorContext::DynamicTag {
+                    tag: DT_PREINIT_ARRAY,
+                    value,
                 },
             ));
         }
@@ -692,6 +717,8 @@ pub struct LoadLimits {
     max_dynamic_entries: u64,
     // Counts unique records after normalizing overlapping main/PLT tables.
     max_relocations: u64,
+    // Counts declared array slots (including sentinels) and direct init/fini calls.
+    max_lifecycle_entries: u64,
 }
 
 impl LoadLimits {
@@ -703,6 +730,7 @@ impl LoadLimits {
         1024 * 1024 * 1024,
         1024,
         64 * 1024,
+        1024,
     );
 
     #[inline]
@@ -714,6 +742,7 @@ impl LoadLimits {
         max_segment_alignment: u64,
         max_dynamic_entries: u64,
         max_relocations: u64,
+        max_lifecycle_entries: u64,
     ) -> Self {
         Self {
             max_file_len,
@@ -723,6 +752,7 @@ impl LoadLimits {
             max_segment_alignment,
             max_dynamic_entries,
             max_relocations,
+            max_lifecycle_entries,
         }
     }
 
@@ -766,6 +796,20 @@ impl LoadLimits {
     pub const fn with_max_relocations(mut self, maximum: u64) -> Self {
         self.max_relocations = maximum;
         self
+    }
+
+    #[inline]
+    pub const fn with_max_lifecycle_entries(mut self, maximum: u64) -> Self {
+        self.max_lifecycle_entries = maximum;
+        self
+    }
+
+    pub fn check_lifecycle_entry_count(&self, actual: u64) -> LoadResult<()> {
+        check_limit(
+            LimitKind::LifecycleEntryCount,
+            actual,
+            self.max_lifecycle_entries,
+        )
     }
 
     pub fn check_dynamic_entry_count(&self, actual: u64) -> LoadResult<()> {

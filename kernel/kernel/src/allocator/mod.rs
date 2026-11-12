@@ -321,6 +321,34 @@ pub fn realloc(ptr: *mut u8, newsize: usize) -> *mut u8 {
     }
 }
 
+/// Resize a malloc-family heap block with a caller-specified result alignment.
+/// Failure leaves the original block owned by the caller. As with realloc(),
+/// ptr must be null or an exclusively owned live block from this heap.
+pub fn realloc_align(ptr: *mut u8, size: usize, align: usize) -> *mut u8 {
+    if Layout::from_size_align(size, align).is_err() {
+        return ptr::null_mut();
+    }
+    if size == 0 {
+        free(ptr);
+        return ptr::null_mut();
+    }
+    let Some(old) = core::ptr::NonNull::new(ptr) else {
+        return malloc_align(size, align);
+    };
+    // The heap reads its own metadata while holding its lock. No allocation
+    // header layout or size bookkeeping is exposed to the application libc.
+    let old_size = HEAP.size_of_allocation(old);
+    if size <= old_size && ptr.addr().is_multiple_of(align) {
+        return ptr;
+    }
+    let moved = malloc_align(size, align);
+    if !moved.is_null() {
+        unsafe { ptr::copy_nonoverlapping(ptr, moved, old_size.min(size)) };
+        free(ptr);
+    }
+    moved
+}
+
 /// Allocates memory for an array of elements and initializes all bytes in this block to zero.
 ///
 /// Returns a null pointer if `count * size` overflows `usize` or the

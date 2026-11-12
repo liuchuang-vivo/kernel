@@ -49,6 +49,36 @@ build_rust("librs_swi") {
 
   # librs_swi will be used in apps dynamically loaded.
   configs += [ "//build/boards/${board}:app_config" ]
+  if (board_toolchain_info.current_cpu == "riscv32") {
+    deps += [ ":app_atomic" ]
+  }
+}
+
+# Flat RV32IMC applications run in machine mode and need PIC helpers for
+# compiler-emitted atomics. Do not link the kernel's static-address objects.
+if (board_toolchain_info.current_cpu == "riscv32") {
+  static_library("app_atomic") {
+    sources = [
+      "//kernel/kernel/src/sync/libatomic/atomic.c",
+      "start/riscv/atomic_irq.S",
+    ]
+    cflags = [ "-fPIC" ]
+  }
+}
+
+# Standard ELF entry for self-contained applications. Keep the firmware's
+# rsrt/__librs_start_main path separate from this application-side CRT.
+if (board_toolchain_info.current_cpu == "riscv32" ||
+    board_toolchain_info.current_cpu == "riscv64" ||
+    board_toolchain_info.current_cpu == "aarch64") {
+  static_library("crt1") {
+    if (board_toolchain_info.current_cpu == "aarch64") {
+      sources = [ "start/aarch64/crt1.S" ]
+    } else {
+      sources = [ "start/riscv/crt1.S" ]
+    }
+    cflags = [ "-fPIC" ]
+  }
 }
 
 run_clippy("librs_swi_clippy") {

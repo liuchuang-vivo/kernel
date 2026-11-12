@@ -13,6 +13,7 @@
 // limitations under the License.
 
 extern crate librs;
+#[cfg(not(feature = "standalone"))]
 extern crate rsrt;
 use std::{
     io::{self, Write},
@@ -22,7 +23,7 @@ use std::{
 mod commands;
 use commands::COMMANDS;
 
-#[cfg(not(enable_vfs))]
+#[cfg(all(not(feature = "standalone"), not(enable_vfs)))]
 compile_error!("Shell app requires vfs to run. Please enable vfs in Kconfig.");
 
 fn main() {

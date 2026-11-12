@@ -12,29 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A finalized image retaining its mapping, segment metadata and RELRO range.
+//! A finalized image retaining its mapping, lifecycle plan and runtime metadata.
 
-use super::LoadRequest;
 use crate::{
     elf::{DynamicInfo, LoadSegmentInfo},
+    lifecycle::LifecyclePlan,
     memory::{ImageMapping, ProtectionLevel, TargetAddress, TargetRange},
+    LoadRequest, ProgramHeaderTable,
 };
 use alloc::vec::Vec;
 
 /// Memory finalization does not execute initialization or start the application.
 #[must_use = "retain the sealed image to keep its allocation alive"]
 pub(crate) struct SealedImage<A: ImageMapping> {
-    pub(super) allocation: A,
+    pub(crate) program_headers: Option<ProgramHeaderTable>,
+    pub(crate) allocation: A,
     pub(super) request: LoadRequest,
     pub(super) segments: Vec<LoadSegmentInfo>,
     pub(super) image_range: TargetRange,
-    pub(super) entry: Option<TargetAddress>,
+    pub(crate) entry: Option<TargetAddress>,
     pub(super) dynamic: Option<DynamicInfo>,
     pub(super) relro: Option<TargetRange>,
     pub(super) protection_level: ProtectionLevel,
+    pub(crate) lifecycle: LifecyclePlan,
 }
 
 impl<A: ImageMapping> SealedImage<A> {
+    pub(crate) const fn lifecycle(&self) -> &LifecyclePlan {
+        &self.lifecycle
+    }
+
     pub(crate) const fn allocation(&self) -> &A {
         &self.allocation
     }

@@ -47,7 +47,8 @@ pub mod syscalls;
 mod tmpfs;
 mod utils;
 use alloc::string::String;
-pub use file::AccessMode;
+pub use file::{AccessMode, File, FileOps};
+pub use path::open_path;
 #[cfg(enable_net)]
 pub use sockfs::{alloc_sock_fd, free_sock_fd, get_sock_by_fd, sock_attach_to_fd};
 

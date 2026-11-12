@@ -52,6 +52,18 @@ extern "C" fn emutls_key_destructor(arg: *mut c_void) {
     drop(boxed_array);
 }
 
+/// Release any emutls storage recreated by the runtime's final stdio flush.
+/// Called only after application callbacks and key destructors have finished.
+pub(crate) fn release_my_storage() {
+    if let Some(&key) = EMUTLS_PTHREAD_KEY.get() {
+        let pointer = pthread_getspecific(key);
+        if !pointer.is_null() {
+            pthread_setspecific(key, core::ptr::null());
+            emutls_key_destructor(pointer);
+        }
+    }
+}
+
 fn get_or_create_emutls_key() -> &'static pthread_key_t {
     EMUTLS_PTHREAD_KEY.call_once(|| {
         let mut key: pthread_key_t = 0;
@@ -112,8 +124,8 @@ fn allocate_object(ctrl: &EmutlsControl) -> *mut u8 {
     unsafe {
         // We'll deallocate it via `free()`.
         let rc = posix_memalign(
-            &mut base as *mut *mut u8 as *mut *mut libc::c_void,
-            align,
+            (&raw mut base).cast(),
+            align.max(core::mem::size_of::<*mut c_void>()),
             size,
         );
         assert_eq!(rc, 0);

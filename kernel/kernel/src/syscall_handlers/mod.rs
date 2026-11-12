@@ -390,37 +390,48 @@ create_thread(spawn_args_ptr: *const SpawnArgs) -> c_long {
     let Some(stack) = Stack::from_raw(spawn_args.stack_start, spawn_args.stack_size) else {
         return -1;
     };
-    let t = Builder::new(Entry::Posix(spawn_args.entry, spawn_args.arg))
+    let mut t = Builder::new(Entry::Posix(spawn_args.entry, spawn_args.arg))
                 .set_stack(stack)
                 .build();
+    let handle = Thread::id(&t);
+    #[cfg(loader_backend)]
+    let group = crate::loader::application::for_thread(scheduler::current_thread_id());
+    #[cfg(loader_backend)]
+    if let Some(group) = &group {
+        // Prepare before installing membership. A failed create leaves the
+        // caller owning its stack; never invoke its C cleanup on this path.
+        let Ok(cleanup) = group.child_cleanup(handle, spawn_args.cleanup, spawn_args.arg as usize) else {
+            thread::GlobalQueueVisitor::remove(&mut t);
+            return -1;
+        };
+        if group.attach(t.clone()).is_err() {
+            thread::GlobalQueueVisitor::remove(&mut t);
+            return -1;
+        }
+        t.lock().set_deferred_cleanup(cleanup);
+    } else if let Some(cleanup) = spawn_args.cleanup {
+        t.lock().set_cleanup(Entry::Posix(cleanup, spawn_args.arg));
+    }
+    #[cfg(not(loader_backend))]
     if let Some(cleanup) = spawn_args.cleanup {
         t.lock().set_cleanup(Entry::Posix(cleanup, spawn_args.arg));
-    };
-    // Link the new thread to the caller's process so that it shares the
-    // caller's per-process fd table (stdin/stdout/stderr and any open files).
-    // Without this, `current_process()` resolves to `None` on the new thread
-    // and every VFS syscall returns `-EBADF` — i.e. the thread has no I/O.
-    // `add_thread` takes the thread by value, so clone the `Arc` here; the
-    // original `t` is still queued below.
-    match crate::process::current_process() {
-        Some(proc) => {
-            if !proc.add_thread(t.clone()) {
-                log::warn!(
-                    "create_thread: new thread not linked to process"
-                );
-            }
-        }
-        None => {
-            log::warn!("create_thread: caller has no process; new thread will have no fd table");
-        }
     }
-    let handle = Thread::id(&t);
+    // Process association is optional for direct RTOS applications. When one
+    // exists, inherit its fd table before publishing the runnable thread.
+    if let Some(process) = crate::process::current_process()
+        && !process.add_thread(t.clone())
+    {
+        thread::GlobalQueueVisitor::remove(&mut t);
+        let cleanup = t.lock().take_cleanup();
+        drop(cleanup);
+        #[cfg(loader_backend)]
+        if let Some(group) = &group { group.finish(handle); }
+        return -1;
+    }
     if let Some(f) = spawn_args.spawn_hook { f(handle, spawn_args_ptr as *mut _); }
-    let ok = scheduler::queue_ready_thread(thread::IDLE, t);
-    // We don't increment the rc of the created thread since it's also
-    // referenced by the global queue. When this thread is retired,
-    // it's removed from the global queue.
-    debug_assert_eq!(ok, Ok(()));
+    // This fresh, unpublished IDLE thread cannot already be on a ready queue.
+    // The spawn hook registers libc metadata before another CPU can execute it.
+    assert_eq!(scheduler::queue_ready_thread(thread::IDLE, t), Ok(()));
     // Same-width integer cast (usize -> c_long): c_long matches the pointer
     // width on every target of this repo (i64 on LP64, i32 on ILP32/cortex-m),
     // so it stays value-identical to the previous transmute, but safe.
@@ -499,7 +510,9 @@ define_syscall_handler!(
 
 define_syscall_handler!(
 alloc_mem(ptr: *mut *mut c_void, size: usize, align: usize) -> c_long {
-    if ptr.is_null() {
+    if ptr.is_null() || !ptr.is_aligned()
+        || core::alloc::Layout::from_size_align(size, align).is_err()
+    {
         return -1;
     }
     let addr = crate::allocator::malloc_align(size, align);
@@ -513,6 +526,22 @@ alloc_mem(ptr: *mut *mut c_void, size: usize, align: usize) -> c_long {
 define_syscall_handler!(
 free_mem(ptr: *mut c_void) -> c_long {
     crate::allocator::free(ptr as *mut u8);
+    0
+});
+
+// Preserve libc's minimum alignment while the kernel recovers the old size.
+define_syscall_handler!(
+realloc_mem(output: *mut *mut c_void, old: *mut c_void, size: usize, align: usize) -> c_long {
+    if output.is_null() || !output.is_aligned()
+        || core::alloc::Layout::from_size_align(size, align).is_err()
+    {
+        return -1;
+    }
+    let moved = crate::allocator::realloc_align(old.cast(), size, align);
+    if moved.is_null() && size != 0 { return -1; }
+    // The flat syscall ABI requires an exclusive output slot valid throughout
+    // the call, outside the allocation being resized. Failure leaves it intact.
+    unsafe { output.write(moved.cast()) };
     0
 });
 
@@ -549,6 +578,39 @@ define_syscall_handler!(
 define_syscall_handler!(exit_thread() -> c_long {
     scheduler::retire_me();
     -1
+});
+
+// These operations coordinate this kernel's standalone application runtime;
+// they are not Linux exit/exit_group syscall numbers or forced cancellation.
+define_syscall_handler!(application_begin_exit(status: c_int) -> c_long {
+    #[cfg(loader_backend)]
+    {
+        let id = scheduler::current_thread_id();
+        let Some(group) = crate::loader::application::for_thread(id) else {
+            return -(ESRCH as c_long);
+        };
+        group.begin_exit(id, status).map_or(-(EBUSY as c_long), |()| 0)
+    }
+    #[cfg(not(loader_backend))]
+    { -(libc::ENOSYS as c_long) }
+});
+
+define_syscall_handler!(application_finish_exit() -> c_long {
+    #[cfg(loader_backend)]
+    {
+        let id = scheduler::current_thread_id();
+        let Some(group) = crate::loader::application::for_thread(id) else {
+            return -(ESRCH as c_long);
+        };
+        let result = group.finish_exit(id);
+        // retire_me never returns: release the syscall's temporary owner first.
+        drop(group);
+        if result.is_err() { return -(EBUSY as c_long); }
+        scheduler::retire_me();
+        -1
+    }
+    #[cfg(not(loader_backend))]
+    { -(libc::ENOSYS as c_long) }
 });
 
 define_syscall_handler!(sched_yield() -> c_long {
@@ -864,6 +926,8 @@ syscall_table! {
     (SetSchedParam, set_sched_param),
     (CreateThread, create_thread),
     (ExitThread, exit_thread),
+    (ApplicationBeginExit, application_begin_exit),
+    (ApplicationFinishExit, application_finish_exit),
     (AtomicWake, atomic_wake),
     (AtomicWait, atomic_wait),
     // For test only
@@ -877,6 +941,7 @@ syscall_table! {
     (TimerGetOverrun, timer_getoverrun),
     (AllocMem, alloc_mem),
     (FreeMem, free_mem),
+    (ReallocMem, realloc_mem),
     (Write, write),
     (Close, close),
     (Read, read),

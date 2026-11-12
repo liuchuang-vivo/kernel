@@ -56,10 +56,10 @@ pub fn command(args: &[&str]) -> Result<(), String> {
 
         match result {
             Ok(_) => {
-                if let Some(m) = mode {
-                    if let Err(e) = set_permissions(path, m) {
-                        return Err(format!("failed to set permissions for '{}': {}", dir, e));
-                    }
+                if let Some(m) = mode
+                    && let Err(e) = set_permissions(path, m)
+                {
+                    return Err(format!("failed to set permissions for '{}': {}", dir, e));
                 }
                 if verbose {
                     println!("created directory '{}'", dir);
@@ -96,10 +96,10 @@ fn create_dir_recursive(path: &Path) -> io::Result<()> {
     let mut current_path = PathBuf::new();
     for component in path.components() {
         current_path.push(component);
-        if let Err(e) = fs::create_dir(&current_path) {
-            if e.kind() != io::ErrorKind::AlreadyExists {
-                return Err(e);
-            }
+        if let Err(e) = fs::create_dir(&current_path)
+            && e.kind() != io::ErrorKind::AlreadyExists
+        {
+            return Err(e);
         }
     }
     Ok(())

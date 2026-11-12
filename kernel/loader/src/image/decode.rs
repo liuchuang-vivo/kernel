@@ -16,16 +16,17 @@
 
 use alloc::vec::Vec;
 
-use super::{relocate::RelocatedImage, LoadRequest};
+use super::relocate::RelocatedImage;
 use crate::{
     elf::{DynamicInfo, LoadSegmentInfo, RelocationRecord},
     error::LoadStage,
     memory::{ImageMapping, TargetAddress, TargetRange},
-    relocation, LoadResult,
+    relocation, LoadRequest, LoadResult, ProgramHeaderTable,
 };
 
 #[must_use = "retain the decoded image to keep its allocation alive"]
 pub(crate) struct DecodedImage<A: ImageMapping> {
+    pub(super) program_headers: Option<ProgramHeaderTable>,
     pub(super) allocation: A,
     pub(super) request: LoadRequest,
     pub(super) segments: Vec<LoadSegmentInfo>,
@@ -51,6 +52,7 @@ impl<A: ImageMapping> DecodedImage<A> {
             &self.relocations,
         )?;
         Ok(RelocatedImage {
+            program_headers: self.program_headers,
             allocation: self.allocation,
             request: self.request,
             segments: self.segments,

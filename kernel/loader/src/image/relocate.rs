@@ -14,17 +14,19 @@
 
 //! A relocated image awaiting cache synchronization and final protection.
 
-use super::{seal::SealedImage, LoadRequest};
+use super::seal::SealedImage;
 use crate::{
     elf::{DynamicInfo, LoadSegmentInfo, RelocationRecord},
     error::{ErrorContext, LoadErrorKind, LoadStage},
+    lifecycle::LifecyclePlan,
     memory::{AllocationOffset, ImageMapping, MemoryPermissions, TargetAddress, TargetRange},
-    CodeCache, LoadError, LoadResult,
+    CodeCache, LoadError, LoadRequest, LoadResult, ProgramHeaderTable,
 };
 use alloc::vec::Vec;
 
 #[must_use = "retain the relocated image to keep its allocation alive"]
 pub(crate) struct RelocatedImage<A: ImageMapping> {
+    pub(super) program_headers: Option<ProgramHeaderTable>,
     pub(super) allocation: A,
     pub(super) request: LoadRequest,
     pub(super) segments: Vec<LoadSegmentInfo>,
@@ -48,6 +50,13 @@ impl<A: ImageMapping> RelocatedImage<A> {
             .check_protection_level(protection_level)?;
         let base = self.allocation.base();
         base.checked_add(self.allocation.len())?;
+        let lifecycle = LifecyclePlan::build(
+            &self.allocation,
+            self.request.profile(),
+            &self.segments,
+            self.image_range,
+            self.dynamic.as_ref(),
+        )?;
         // Ordinary segment permissions are already active. Publish completed
         // code writes before execution and before closing writable RELRO.
         for segment in &self.segments {
@@ -102,6 +111,7 @@ impl<A: ImageMapping> RelocatedImage<A> {
                 })?;
         }
         Ok(SealedImage {
+            program_headers: self.program_headers,
             allocation: self.allocation,
             request: self.request,
             segments: self.segments,
@@ -110,6 +120,7 @@ impl<A: ImageMapping> RelocatedImage<A> {
             dynamic: self.dynamic,
             relro: self.relro,
             protection_level,
+            lifecycle,
         })
     }
 

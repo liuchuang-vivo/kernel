@@ -65,7 +65,13 @@ blueos_board("seeed_xiao_esp32c3") {
     "//example/agent_loop:agent_loop",
   ]
   _check_all = check_all_on_virtual_board + clippy_all_on_virtual_board
-  check_all = filter_exclude(_check_all, [ "//kernel/adapter*" ])
+
+  _check_excludes = [ "//kernel/adapter*" ]
+  if (!release) {
+    # Debug loader test firmware exceeds the 1 MiB factory partition.
+    _check_excludes += [ "//kernel/loader:check_loader" ]
+  }
+  check_all = filter_exclude(_check_all, _check_excludes)
 
   check_all += [ "//kernel/adapter/esp_radio_sys:run_esp_radio_sys_unittest" ]
 }

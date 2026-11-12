@@ -28,7 +28,7 @@ use crate::{
 use goblin::{elf32, elf64};
 
 pub(crate) use dynamic::{read_dynamic, DynamicInfo};
-pub use header::{ElfClass, ElfData, ElfMachine};
+pub use header::{ElfClass, ElfData, ElfMachine, ProgramHeaderTable};
 pub(crate) use header::{ElfHeaderInfo, ElfType};
 pub(crate) use program_header::ProgramHeaderInfo;
 pub(crate) use relocation::{RelocationAddend, RelocationRecord};

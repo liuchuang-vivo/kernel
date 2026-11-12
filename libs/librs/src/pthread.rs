@@ -397,22 +397,19 @@ pub extern "C" fn pthread_join(tid: pthread_t, retval: *mut *mut c_void) -> c_in
     0
 }
 
-#[linkage = "weak"]
-#[unsafe(no_mangle)]
-pub extern "C" fn pthread_exit(retval: *mut c_void) -> ! {
-    // pthread_detach must fail if tcb.state != RUNNING.
-    let tid = pthread_self();
-    let Some(tcb) = get_tcb(tid) else {
-        panic!("{:x}: My tcb is gone!", tid)
-    };
+fn run_key_destructors(tcb: &PthreadTcb) {
     // We have to cleanup all resources allocated. It *MUST* happen-before `remove_tcb` since
     // dtors might expect the current tcb is still in the TCBS.
-    {
+    // POSIX requires at least four passes when callbacks install new values.
+    for _ in 0..4 {
         let read_tcb_kv = tcb.kv.read();
         // We have to collect dtors and vals first, since some dtors might write KEYS.
         let mut dtors = Vec::new();
         let mut vals = Vec::new();
         for (key, val) in read_tcb_kv.iter() {
+            if *val == 0 {
+                continue;
+            }
             let keys = KEYS.read();
             if let Some(dtor) = keys.get(key) {
                 let ptr: *mut c_void = unsafe { *val as *mut c_void };
@@ -423,10 +420,46 @@ pub extern "C" fn pthread_exit(retval: *mut c_void) -> ! {
             }
         }
         drop(read_tcb_kv);
+        if dtors.is_empty() {
+            break;
+        }
         for i in 0..dtors.len() {
+            // A destructor may use this key again (notably emutls). Remove
+            // its old value before calling it, so that value cannot be reused.
+            tcb.kv.write().remove(&vals[i].0);
             dtors[i](vals[i].1);
         }
     }
+}
+
+/// Run main-thread key destructors while its TCB and standard streams live.
+pub(crate) fn run_my_key_destructors() {
+    if let Some(tcb) = get_my_tcb() {
+        run_key_destructors(&tcb);
+    }
+}
+
+/// Discard metadata after destructors and stdio have finished. Only used by
+/// a standalone application with its own libc and no remaining pthread users.
+pub(crate) fn cleanup_my_tcb() {
+    // A final stdio error may have recreated errno/emutls storage. Free it
+    // directly; user destructors must not run after standard streams close.
+    crate::tls::release_my_storage();
+    // Application exit has waited for all child cleanup. Clear also releases the
+    // empty root node that BTreeMap may retain after removing its last entry.
+    TCBS.write().clear();
+    KEYS.write().clear();
+}
+
+#[linkage = "weak"]
+#[unsafe(no_mangle)]
+pub extern "C" fn pthread_exit(retval: *mut c_void) -> ! {
+    // pthread_detach must fail if tcb.state != RUNNING.
+    let tid = pthread_self();
+    let Some(tcb) = get_tcb(tid) else {
+        panic!("{:x}: My tcb is gone!", tid)
+    };
+    run_key_destructors(&tcb);
     {
         let detached = tcb.detached.swap(-1, Ordering::SeqCst);
         assert_ne!(detached, -1, "pthread_exit should be only called once");

@@ -14,18 +14,21 @@
 
 //! Backend-mediated mapping, ownership, malformed results and partial failure.
 
-use super::fixture::{ElfFixtureBuilder, ProgramHeaderFixture, SliceElfReader};
+use super::{
+    fixture::{ElfFixtureBuilder, ProgramHeaderFixture},
+    support::SliceElfReader,
+};
 use crate::{
     error::{ErrorContext, LoadErrorKind, LoadStage},
-    image::{ImageLoader, LoadRequest, PlannedImage},
+    image::{ImageLoader, PlannedImage},
     memory::{
-        AllocationOffset, ImageLayout, MemoryMapper, MemoryPermissions, MemoryRegion, Placement,
-        ProtectionLevel, SegmentLayout, TargetAddress, TargetRange,
+        AllocationOffset, ImageLayout, MemoryPermissions, Placement, ProtectionLevel,
+        TargetAddress, TargetRange,
     },
     profile::{ElfClass, LoadLimits, LoadProfile},
-    ElfReader, ImageAllocator, ImageMapping, LoadError, LoadResult,
+    ElfReader, ImageAllocator, ImageMapping, LoadError, LoadRequest, LoadResult,
 };
-use alloc::{boxed::Box, rc::Rc, vec, vec::Vec};
+use alloc::{rc::Rc, vec, vec::Vec};
 use blueos_test_macro::test;
 use core::{cell::RefCell, ops::Range};
 use goblin::elf::{
@@ -87,6 +90,67 @@ fn planned(bytes: &[u8], profile: LoadProfile) -> PlannedImage<SliceElfReader<'_
     .unwrap()
     .plan()
     .unwrap()
+}
+
+#[test]
+fn loaded_program_header_table_requires_complete_file_backing() {
+    struct Cache;
+    impl crate::CodeCache for Cache {
+        fn synchronize(&mut self, _: TargetRange) -> LoadResult<()> {
+            Ok(())
+        }
+    }
+    for profile in PROFILES {
+        let (header_size, entry_size) = match profile.class() {
+            ElfClass::Elf32 => (52, 32),
+            ElfClass::Elf64 => (64, 56),
+        };
+        for (offset, filesz, retained) in [
+            (0, 0x200, true),
+            (0x200, 0x200, false),
+            (0, header_size + entry_size - 1, false),
+        ] {
+            let builder = match profile.class() {
+                ElfClass::Elf32 => ElfFixtureBuilder::elf32(EM_RISCV, ET_DYN),
+                ElfClass::Elf64 => ElfFixtureBuilder::elf64(
+                    if profile == LoadProfile::aarch64() {
+                        EM_AARCH64
+                    } else {
+                        EM_RISCV
+                    },
+                    ET_DYN,
+                ),
+            };
+            let mut bytes = builder
+                .with_entry(0x1180)
+                .with_program_header(ProgramHeaderFixture {
+                    offset,
+                    filesz,
+                    memsz: 0x200,
+                    align: 16,
+                    ..ProgramHeaderFixture::load()
+                })
+                .build();
+            bytes.resize((offset + 0x200) as usize, 0);
+            let image = crate::load_elf(
+                SliceElfReader::new(&bytes),
+                LoadRequest::new(profile, LoadLimits::DEFAULT),
+                MockMemory::new(0x8000),
+                &mut Cache,
+            )
+            .unwrap();
+            if retained {
+                let table = image.program_headers().unwrap();
+                assert_eq!(table.address().get(), 0x8000 + header_size);
+                assert_eq!(u64::from(table.entry_size()), entry_size);
+                assert_eq!(table.count(), 1);
+            } else {
+                // A table absent from PT_LOAD, or extending into its BSS, is
+                // not a valid AT_PHDR even though the image itself can load.
+                assert!(image.program_headers().is_none());
+            }
+        }
+    }
 }
 
 fn failure<T>(result: LoadResult<T>) -> LoadError {
@@ -662,87 +726,6 @@ fn dropping_allocated_and_mapped_images_releases_each_allocation_once() {
     assert_eq!(state.borrow().drops, 2);
 }
 
-fn fixed_test_layout(base: u64, len: u64) -> ImageLayout {
-    ImageLayout::new(
-        Placement::Fixed(TargetRange::new(TargetAddress::new(base), len)),
-        len,
-        16,
-        vec![SegmentLayout::new(
-            AllocationOffset::new(0),
-            len,
-            MemoryPermissions::READ,
-        )],
-    )
-    .unwrap()
-}
-
-#[test]
-fn mapping_runs_with_flat_owned_and_fixed_backends() {
-    let profile = if usize::BITS == 32 {
-        LoadProfile::riscv32()
-    } else {
-        LoadProfile::riscv64()
-    };
-    let bytes = fixture(profile, ET_DYN, 0x1000, 17, 48);
-    let mut memory = MemoryMapper::new(None);
-    let mapped = planned(&bytes, profile)
-        .allocate(&mut memory)
-        .unwrap()
-        .map()
-        .unwrap();
-    let mut contents = [0xff; 48];
-    mapped
-        .read(AllocationOffset::new(0), &mut contents)
-        .unwrap();
-    assert_eq!(&contents[..17], &bytes[PAYLOAD..]);
-    assert_eq!(&contents[17..], &[0; 31]);
-    let base = mapped.allocation().base();
-    assert_eq!(mapped.entry().unwrap(), base.checked_add(4).unwrap());
-    drop(mapped);
-
-    let storage = Box::leak(Box::new(
-        blueos_infra::storage::Storage::try_from_layout(
-            core::alloc::Layout::from_size_align(128, 16).unwrap(),
-        )
-        .unwrap(),
-    ));
-    let base = storage.base() as usize;
-    // SAFETY: static storage owns this writable range. Tests access its bytes
-    // through the mapper while the allocation is live, and never execute it.
-    let region = unsafe {
-        MemoryRegion::new(
-            base,
-            base + 128,
-            MemoryPermissions::READ
-                .bitor(MemoryPermissions::WRITE)
-                .bitor(MemoryPermissions::EXECUTE),
-        )
-    };
-    let regions = Box::leak(Box::new([region]));
-    let mut memory = MemoryMapper::new(Some(regions));
-    let bytes = fixture(profile, ET_EXEC, base as u64, 17, 48);
-    let allocated = planned(&bytes, profile).allocate(&mut memory).unwrap();
-    drop(allocated);
-    let mapped = planned(&bytes, profile)
-        .allocate(&mut memory)
-        .unwrap()
-        .map()
-        .unwrap();
-    assert_eq!(mapped.entry().unwrap().get(), base as u64 + 4);
-    assert_eq!(mapped.load_bias(), 0);
-    mapped
-        .read(AllocationOffset::new(0), &mut contents)
-        .unwrap();
-    assert_eq!(&contents[..17], &bytes[PAYLOAD..]);
-    assert_eq!(&contents[17..], &[0; 31]);
-    drop(mapped);
-    let next = memory
-        .prepare_image(&fixed_test_layout(base as u64, 48))
-        .unwrap();
-    next.read(AllocationOffset::new(0), &mut contents).unwrap();
-    assert_eq!(contents, [0; 48]);
-}
-
 #[test]
 fn mapping_checks_runtime_entry_alignment_before_payload_access() {
     for profile in PROFILES {
@@ -770,87 +753,5 @@ fn mapping_checks_runtime_entry_alignment_before_payload_access() {
         assert_eq!(error.kind(), LoadErrorKind::InvalidAlignment);
         assert_eq!(state.borrow().writes, 0);
         assert_eq!(state.borrow().drops, 1);
-    }
-}
-
-#[test]
-fn mapping_fixed_input_failure_releases_region_for_a_fresh_load() {
-    let profile = if usize::BITS == 32 {
-        LoadProfile::riscv32()
-    } else {
-        LoadProfile::riscv64()
-    };
-    for fail_on in [1, 2] {
-        let storage = Box::leak(Box::new(
-            blueos_infra::storage::Storage::try_from_layout(
-                core::alloc::Layout::from_size_align(1536, 16).unwrap(),
-            )
-            .unwrap(),
-        ));
-        let base = storage.base() as usize;
-        // SAFETY: static backing owns this writable region. The test neither
-        // executes it nor accesses it through aliases while a handle is live.
-        let region = unsafe {
-            MemoryRegion::new(
-                base,
-                base + 1536,
-                MemoryPermissions::READ
-                    .bitor(MemoryPermissions::WRITE)
-                    .bitor(MemoryPermissions::EXECUTE),
-            )
-        };
-        let regions = Box::leak(Box::new([region]));
-        let mut memory = MemoryMapper::new(Some(regions));
-        let bytes = fixture(profile, ET_EXEC, base as u64, 1200, 1221);
-        let reads = Rc::new(RefCell::new(ReadState {
-            fail_on: Some(fail_on),
-            ..ReadState::default()
-        }));
-        let reader = ObservedReader {
-            bytes: &bytes,
-            state: reads.clone(),
-        };
-        let error = failure(
-            ImageLoader::new(reader, LoadRequest::new(profile, LoadLimits::DEFAULT))
-                .admit()
-                .unwrap()
-                .inspect()
-                .unwrap()
-                .plan()
-                .unwrap()
-                .allocate(&mut memory)
-                .unwrap()
-                .map(),
-        );
-        assert_eq!(error.kind(), LoadErrorKind::Io);
-        assert_eq!(error.stage(), Some(LoadStage::Map));
-        assert_eq!(reads.borrow().drops, 1);
-        // Preparation resets partial bytes from either failure point.
-        let allocation = memory
-            .prepare_image(&fixed_test_layout(base as u64, 1232))
-            .unwrap();
-        let mut contents = [0xff; 1232];
-        allocation
-            .read(AllocationOffset::new(0), &mut contents)
-            .unwrap();
-        assert_eq!(contents, [0; 1232]);
-        drop(allocation);
-        let mapped = planned(&bytes, profile)
-            .allocate(&mut memory)
-            .unwrap()
-            .map()
-            .unwrap();
-        mapped
-            .read(AllocationOffset::new(0), &mut contents[..1221])
-            .unwrap();
-        assert_eq!(&contents[..1200], &bytes[PAYLOAD..]);
-        assert_eq!(&contents[1200..1221], &[0; 21]);
-        assert_eq!(
-            mapped
-                .read(AllocationOffset::new(1221), &mut [0; 11])
-                .unwrap_err()
-                .kind(),
-            LoadErrorKind::PermissionConflict
-        );
     }
 }
