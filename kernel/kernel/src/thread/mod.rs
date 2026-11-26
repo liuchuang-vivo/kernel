@@ -755,7 +755,7 @@ impl Thread {
                 // platform, aka, it's a fat pointer.
                 let raw = Box::into_raw(Box::new(boxed));
                 ctx.set_return_address(run_closure as *const () as usize)
-                    .set_arg(0, raw as *mut Box<dyn FnOnce()> as usize)
+                    .set_arg(0, raw as *mut Box<dyn FnOnce()> as usize);
             }
             Entry::Posix(f, arg) => {
                 ctx.init();

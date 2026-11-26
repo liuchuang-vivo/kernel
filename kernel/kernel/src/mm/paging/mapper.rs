@@ -239,7 +239,7 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
             }
         }
         let result = (|| {
-            self.prepare_range(virt, len)?;
+            unsafe { self.prepare_range(virt, len) }?;
             for va in (start..end).step_by(P::PAGE_SIZE) {
                 let frame = self
                     .allocator
@@ -247,21 +247,23 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
                     .ok_or("out of backing frames")?;
                 if init == FrameInit::Zeroed {
                     let ptr = kernel_phys_to_virt(frame).into_raw() as *mut u8;
-                    ptr.write_bytes(0, P::PAGE_SIZE);
+                    unsafe { ptr.write_bytes(0, P::PAGE_SIZE); }
                 }
                 if let Err(e) =
-                    self.map_range(VirtualAddress::new(va), frame, P::PAGE_SIZE, attributes)
+                    unsafe { self.map_range(VirtualAddress::new(va), frame, P::PAGE_SIZE, attributes) }
                 {
-                    self.allocator
-                        .free_frame(frame)
-                        .expect("return unpublished frame");
+                    unsafe {
+                        self.allocator
+                            .free_frame(frame)
+                            .expect("return unpublished frame");
+                    }
                     return Err(e);
                 }
             }
             Ok(())
         })();
         if result.is_err() {
-            self.release_owned_range(virt, len, &mut synchronize);
+            unsafe { self.release_owned_range(virt, len, &mut synchronize); }
         } else {
             synchronize();
         }
@@ -289,22 +291,24 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
         let end = start.checked_add(len).expect("owned range overflow");
         for va in (start..end).step_by(P::PAGE_SIZE) {
             if let Some(slot) = self.existing_slot(va) {
-                let entry = slot.read();
+                let entry = unsafe { slot.read() };
                 if P::is_valid(entry) {
-                    slot.write(entry & !1);
+                    unsafe { slot.write(entry & !1); }
                 }
             }
         }
         synchronize();
         for va in (start..end).step_by(P::PAGE_SIZE) {
             if let Some(slot) = self.existing_slot(va) {
-                let entry = slot.read();
+                let entry = unsafe { slot.read() };
                 if entry & 0b11 == 0b10 {
                     let frame = P::table_address(entry | 1).expect("retired page descriptor");
-                    slot.write(0);
-                    self.allocator
-                        .free_frame(PhysicalAddress::new(frame))
-                        .expect("release owned backing");
+                    unsafe {
+                        slot.write(0);
+                        self.allocator
+                            .free_frame(PhysicalAddress::new(frame))
+                            .expect("release owned backing");
+                    }
                 }
             }
         }
@@ -315,19 +319,23 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
         let span = P::PAGE_SIZE * (P::PAGE_SIZE / size_of::<usize>());
         let mut va = start;
         while va < end {
-            self.prune_empty_path(va, &mut retired);
+            unsafe { self.prune_empty_path(va, &mut retired); }
             va += (span - (va & (span - 1))).min(end - va);
         }
         if retired != 0 {
             synchronize();
             while retired != 0 {
                 let frame = retired;
-                retired = (kernel_phys_to_virt(PhysicalAddress::new(frame)).into_raw()
-                    as *const usize)
-                    .read();
-                self.allocator
-                    .free_frame(PhysicalAddress::new(frame))
-                    .expect("release empty owned table");
+                retired = unsafe {
+                    (kernel_phys_to_virt(PhysicalAddress::new(frame)).into_raw()
+                        as *const usize)
+                        .read()
+                };
+                unsafe {
+                    self.allocator
+                        .free_frame(PhysicalAddress::new(frame))
+                        .expect("release empty owned table");
+                }
             }
         }
     }
@@ -340,7 +348,7 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
         let mut depth = 0;
         for level in 0..P::LEVELS - 1 {
             let slot = Self::entry_ptr(tables[level as usize], va, level).unwrap();
-            let Some(child) = P::table_address(slot.read()) else {
+            let Some(child) = P::table_address(unsafe { slot.read() }) else {
                 break;
             };
             slots[level as usize] = slot;
@@ -348,16 +356,20 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
             depth = level as usize + 1;
         }
         for level in (1..=depth).rev() {
-            let ptr =
-                kernel_phys_to_virt(PhysicalAddress::new(tables[level])).into_raw() as *mut usize;
-            if core::slice::from_raw_parts(ptr, P::PAGE_SIZE / size_of::<usize>())
-                .iter()
-                .any(|e| *e != 0)
-            {
+            let ptr = kernel_phys_to_virt(PhysicalAddress::new(tables[level])).into_raw()
+                as *mut usize;
+            let nonempty = unsafe {
+                core::slice::from_raw_parts(ptr, P::PAGE_SIZE / size_of::<usize>())
+                    .iter()
+                    .any(|e| *e != 0)
+            };
+            if nonempty {
                 break;
             }
-            slots[level - 1].write(0);
-            ptr.write(*retired);
+            unsafe {
+                slots[level - 1].write(0);
+                ptr.write(*retired);
+            }
             *retired = tables[level];
         }
     }

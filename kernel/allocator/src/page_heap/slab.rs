@@ -61,23 +61,25 @@ impl PageHeap {
             return Err(HeapError::InvalidRequest);
         }
         let (offset, slots) = geometry(class)?;
-        ptr::write(
-            header(span),
-            SlabHeader {
-                free_head: 0,
-                prev: END,
-                next: END,
-                free_count: slots,
-                slot_count: slots,
-                class: class.0 as usize,
-                occupied: [0; 8],
-            },
-        );
-        for i in 0..slots {
+        unsafe {
             ptr::write(
-                slot(span, offset, class.size(), i).cast::<usize>(),
-                if i + 1 == slots { END } else { i + 1 },
+                header(span),
+                SlabHeader {
+                    free_head: 0,
+                    prev: END,
+                    next: END,
+                    free_count: slots,
+                    slot_count: slots,
+                    class: class.0 as usize,
+                    occupied: [0; 8],
+                },
             );
+            for i in 0..slots {
+                ptr::write(
+                    slot(span, offset, class.size(), i).cast::<usize>(),
+                    if i + 1 == slots { END } else { i + 1 },
+                );
+            }
         }
         Ok(())
     }
@@ -133,25 +135,33 @@ impl PageHeap {
     }
 
     unsafe fn unlink(&mut self, class: ClassId, h: *mut SlabHeader) {
-        let (prev, next) = ((*h).prev, (*h).next);
+        let h_ref = unsafe { &mut *h };
+        let (prev, next) = (h_ref.prev, h_ref.next);
         if prev == END {
             self.partial[class.0 as usize] = next;
         } else {
-            (*header(self.window.span(prev, 1).unwrap())).next = next;
+            unsafe {
+                (*header(self.window.span(prev, 1).unwrap())).next = next;
+            }
         }
         if next != END {
-            (*header(self.window.span(next, 1).unwrap())).prev = prev;
+            unsafe {
+                (*header(self.window.span(next, 1).unwrap())).prev = prev;
+            }
         }
-        (*h).prev = END;
-        (*h).next = END;
+        h_ref.prev = END;
+        h_ref.next = END;
     }
 
     unsafe fn link(&mut self, index: usize, class: ClassId, h: *mut SlabHeader) {
+        let h_ref = unsafe { &mut *h };
         let next = self.partial[class.0 as usize];
-        (*h).prev = END;
-        (*h).next = next;
+        h_ref.prev = END;
+        h_ref.next = next;
         if next != END {
-            (*header(self.window.span(next, 1).unwrap())).prev = index;
+            unsafe {
+                (*header(self.window.span(next, 1).unwrap())).prev = index;
+            }
         }
         self.partial[class.0 as usize] = index;
     }
@@ -218,20 +228,24 @@ impl PageHeap {
         let area = self.candidate(span)?;
         let (_, slots) = geometry(class)?;
         let h = header(span);
-        if (*h).class != class.0 as usize
-            || (*h).slot_count != slots
-            || (*h).free_count != slots
-            || (*h).free_head != 0
-            || (*h).prev != END
-            || (*h).next != END
-            || (*h).occupied != [0; 8]
         {
-            return Err(HeapError::CorruptMetadata);
+            let h_ref = unsafe { &*h };
+            if h_ref.class != class.0 as usize
+                || h_ref.slot_count != slots
+                || h_ref.free_count != slots
+                || h_ref.free_head != 0
+                || h_ref.prev != END
+                || h_ref.next != END
+                || h_ref.occupied != [0; 8]
+            {
+                return Err(HeapError::CorruptMetadata);
+            }
         }
         for i in 0..slots {
             let expected = if i + 1 == slots { END } else { i + 1 };
-            if ptr::read(slot(span, geometry(class)?.0, class.size(), i).cast::<usize>())
-                != expected
+            if unsafe {
+                ptr::read(slot(span, geometry(class)?.0, class.size(), i).cast::<usize>())
+            } != expected
             {
                 return Err(HeapError::CorruptMetadata);
             }
@@ -255,17 +269,22 @@ impl PageHeap {
             .ok_or(HeapError::InvalidRequest)?;
         stats.peak_charged_bytes = stats.peak_charged_bytes.max(stats.charged_bytes);
         let p = slot(span, geometry(class)?.0, class.size(), 0);
-        (*h).free_head = if slots == 1 { END } else { 1 };
-        (*h).free_count -= 1;
-        (*h).occupied[0] = 1;
-        self.areas.insert(area)?;
-        area.as_ref().set_kind(Kind::Slab(class));
-        if slots > 1 {
-            self.link(index, class, h);
+        {
+            let h_ref = unsafe { &mut *h };
+            h_ref.free_head = if slots == 1 { END } else { 1 };
+            h_ref.free_count -= 1;
+            h_ref.occupied[0] = 1;
+        }
+        unsafe {
+            self.areas.insert(area)?;
+            area.as_ref().set_kind(Kind::Slab(class));
+            if slots > 1 {
+                self.link(index, class, h);
+            }
         }
         self.stats = stats;
         Ok(SlabCommit::Inserted(Allocation {
-            ptr: NonNull::new_unchecked(p),
+            ptr: unsafe { NonNull::new_unchecked(p) },
             capacity: class.size(),
         }))
     }
@@ -310,8 +329,13 @@ impl PageHeap {
         let (span, h) = self.checked_header(index, class)?;
         let (offset, _) = geometry(class)?;
         let i = (ptr.as_ptr().addr() - span.start.as_ptr().addr() - offset) / class.size();
-        let was_full = (*h).free_count == 0;
-        let empty = (*h).free_count + 1 == (*h).slot_count;
+        let was_full;
+        let empty;
+        {
+            let h_ref = unsafe { &*h };
+            was_full = h_ref.free_count == 0;
+            empty = h_ref.free_count + 1 == h_ref.slot_count;
+        }
         if !was_full {
             self.links(index, class, h)?;
         }
@@ -341,21 +365,26 @@ impl PageHeap {
                 .checked_sub(PAGE_SIZE)
                 .ok_or(HeapError::CorruptMetadata)?;
         }
-        (*h).occupied[i / 64] &= !(1u64 << (i % 64));
-        ptr::write(ptr.as_ptr().cast::<usize>(), (*h).free_head);
-        (*h).free_head = i;
-        (*h).free_count += 1;
+        unsafe {
+            let h_ref = &mut *h;
+            h_ref.occupied[i / 64] &= !(1u64 << (i % 64));
+            ptr::write(ptr.as_ptr().cast::<usize>(), h_ref.free_head);
+            h_ref.free_head = i;
+            h_ref.free_count += 1;
+        }
         if empty {
-            if !was_full {
-                self.unlink(class, h);
+            unsafe {
+                if !was_full {
+                    self.unlink(class, h);
+                }
+                let node = self
+                    .areas
+                    .remove(span.start().as_ptr().addr())
+                    .ok_or(HeapError::CorruptMetadata)?;
+                node.as_ref().set_kind(Kind::Empty);
             }
-            let node = self
-                .areas
-                .remove(span.start().as_ptr().addr())
-                .ok_or(HeapError::CorruptMetadata)?;
-            node.as_ref().set_kind(Kind::Empty);
         } else if was_full {
-            self.link(index, class, h);
+            unsafe { self.link(index, class, h); }
         }
         self.stats = stats;
         Ok(if empty {

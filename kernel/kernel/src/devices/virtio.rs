@@ -131,16 +131,18 @@ unsafe impl Hal for VirtioHal {
 
     unsafe fn dma_dealloc(paddr: PhysAddr, vaddr: NonNull<u8>, pages: usize) -> i32 {
         #[cfg(paging)]
-        crate::mm::paging::first_fit::FirstFitFrameAllocator::instance()
-            .free_frames(PhysicalAddress::new(paddr), pages)
-            .expect("release DMA pages");
+        unsafe {
+            crate::mm::paging::first_fit::FirstFitFrameAllocator::instance()
+                .free_frames(PhysicalAddress::new(paddr), pages)
+                .expect("release DMA pages");
+        }
         #[cfg(not(paging))]
         unsafe {
             dealloc(
                 vaddr.as_ptr(),
                 Layout::from_size_align(pages * PAGE_SIZE, PAGE_SIZE).unwrap(),
-            )
-        };
+            );
+        }
         0
     }
 
@@ -156,14 +158,21 @@ unsafe impl Hal for VirtioHal {
             if len == 0 {
                 return 0;
             }
-            let (physical, bounce) = Self::dma_alloc(len.div_ceil(PAGE_SIZE), direction);
+            let (physical, bounce) = unsafe { Self::dma_alloc(len.div_ceil(PAGE_SIZE), direction) };
             if direction != BufferDirection::DeviceToDriver {
-                core::ptr::copy_nonoverlapping(buffer.as_ptr() as *const u8, bounce.as_ptr(), len);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        buffer.as_ptr() as *const u8,
+                        bounce.as_ptr(),
+                        len,
+                    );
+                }
             }
             physical
         }
         #[cfg(not(paging))]
-        kernel_virt_to_phys(VirtualAddress::new(buffer.as_ptr() as *mut u8 as usize)).into_raw()
+        kernel_virt_to_phys(VirtualAddress::new(buffer.as_ptr() as *mut u8 as usize))
+            .into_raw()
     }
 
     unsafe fn unshare(paddr: PhysAddr, buffer: NonNull<[u8]>, direction: BufferDirection) {
@@ -178,9 +187,15 @@ unsafe impl Hal for VirtioHal {
             )
             .unwrap();
             if direction != BufferDirection::DriverToDevice {
-                core::ptr::copy_nonoverlapping(bounce.as_ptr(), buffer.as_ptr() as *mut u8, len);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        bounce.as_ptr(),
+                        buffer.as_ptr() as *mut u8,
+                        len,
+                    );
+                }
             }
-            Self::dma_dealloc(paddr, bounce, len.div_ceil(PAGE_SIZE));
+            unsafe { Self::dma_dealloc(paddr, bounce, len.div_ceil(PAGE_SIZE)); }
         }
     }
 }

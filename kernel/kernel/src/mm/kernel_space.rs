@@ -105,11 +105,13 @@ impl KernelAddressSpace {
     pub(crate) unsafe fn release_heap(&self, start: usize, pages: usize) {
         let len = pages.checked_mul(PageEntry::PAGE_SIZE).expect("heap size");
         assert!(start >= HEAP_START && start.checked_add(len).is_some_and(|end| end <= HEAP_END));
-        self.mapper.irqsave_lock().release_owned_range(
-            super::VirtualAddress::new(start),
-            len,
-            crate::arch::mmu::sync_kernel_mappings,
-        );
+        unsafe {
+            self.mapper.irqsave_lock().release_owned_range(
+                super::VirtualAddress::new(start),
+                len,
+                crate::arch::mmu::sync_kernel_mappings,
+            );
+        }
     }
 
     /// Map a physical memory region to the kernel virtual address space.

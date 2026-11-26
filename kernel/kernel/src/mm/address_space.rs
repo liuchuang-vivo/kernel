@@ -335,10 +335,10 @@ impl AddressSpace {
         let vmas = &mut state.vmas;
         // Reject overlap with the immediately-following VMA: its start must be
         // >= new_end. The next node's start is the BTreeMap key (free).
-        if let Some((next_start, _)) = vmas.range((Excluded(start), Unbounded)).next() {
-            if *next_start < new_end {
-                return Err(error::code::EINVAL);
-            }
+        if let Some((next_start, _)) = vmas.range((Excluded(start), Unbounded)).next()
+            && *next_start < new_end
+        {
+            return Err(error::code::EINVAL);
         }
         vmas.get_mut(&start).unwrap().set_end(new_end)?;
         Ok(())
@@ -443,10 +443,10 @@ impl AddressSpace {
     /// `true` if a `[start, end)` range would overlap any existing VMA.
     /// Caller holds the tree lock. `start` is the BTreeMap key
     fn overlaps(vmas: &BTreeMap<usize, Vma>, start: usize, end: usize) -> bool {
-        if let Some((_, prev)) = vmas.range(..=start).next_back() {
-            if prev.end() > start {
-                return true;
-            }
+        if let Some((_, prev)) = vmas.range(..=start).next_back()
+            && prev.end() > start
+        {
+            return true;
         }
         if vmas.range(start..end).next().is_some() {
             return true;

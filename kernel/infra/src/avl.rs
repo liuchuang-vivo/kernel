@@ -104,60 +104,75 @@ impl<T, A: Adapter<T>> AvlTree<T, A> {
     }
 
     unsafe fn links(node: NonNull<T>) -> *mut Links<T> {
-        let link = node
-            .as_ptr()
-            .cast::<u8>()
-            .add(A::offset())
-            .cast::<AvlLink<T>>();
-        (*link).links.get()
+        let link = unsafe { node.as_ptr().cast::<u8>().add(A::offset()) }.cast::<AvlLink<T>>();
+        unsafe { (*link).links.get() }
     }
 
     unsafe fn height(node: Option<NonNull<T>>) -> i16 {
-        node.map_or(0, |node| (*Self::links(node)).height as i16)
+        node.map_or(0, |node| {
+            let links = unsafe { Self::links(node) };
+            (unsafe { (*links).height }) as i16
+        })
     }
 
     unsafe fn update(node: NonNull<T>) {
-        let links = Self::links(node);
-        (*links).height = (1 + Self::height((*links).left).max(Self::height((*links).right))) as u8;
+        let links = unsafe { Self::links(node) };
+        let left = unsafe { (*links).left };
+        let right = unsafe { (*links).right };
+        let h = (1 + unsafe { Self::height(left) }.max(unsafe { Self::height(right) })) as u8;
+        unsafe { (*links).height = h; }
     }
 
     unsafe fn rotate_left(node: NonNull<T>) -> NonNull<T> {
-        let top = (*Self::links(node)).right.unwrap();
-        (*Self::links(node)).right = (*Self::links(top)).left;
-        (*Self::links(top)).left = Some(node);
-        Self::update(node);
-        Self::update(top);
+        let links = unsafe { Self::links(node) };
+        let top = unsafe { (*links).right }.unwrap();
+        let top_links = unsafe { Self::links(top) };
+        let moved = unsafe { (*top_links).left };
+        unsafe { (*links).right = moved; }
+        unsafe { (*top_links).left = Some(node); }
+        unsafe { Self::update(node); }
+        unsafe { Self::update(top); }
         top
     }
 
     unsafe fn rotate_right(node: NonNull<T>) -> NonNull<T> {
-        let top = (*Self::links(node)).left.unwrap();
-        (*Self::links(node)).left = (*Self::links(top)).right;
-        (*Self::links(top)).right = Some(node);
-        Self::update(node);
-        Self::update(top);
+        let links = unsafe { Self::links(node) };
+        let top = unsafe { (*links).left }.unwrap();
+        let top_links = unsafe { Self::links(top) };
+        let moved = unsafe { (*top_links).right };
+        unsafe { (*links).left = moved; }
+        unsafe { (*top_links).right = Some(node); }
+        unsafe { Self::update(node); }
+        unsafe { Self::update(top); }
         top
     }
 
     unsafe fn balance(node: NonNull<T>) -> NonNull<T> {
-        Self::update(node);
-        let links = Self::links(node);
-        let balance = Self::height((*links).left) - Self::height((*links).right);
+        unsafe { Self::update(node); }
+        let links = unsafe { Self::links(node) };
+        let balance =
+            unsafe { Self::height((*links).left) } - unsafe { Self::height((*links).right) };
         if balance > 1 {
-            let child = (*links).left.unwrap();
-            let child_links = Self::links(child);
-            if Self::height((*child_links).left) < Self::height((*child_links).right) {
-                (*links).left = Some(Self::rotate_left(child));
+            let child = unsafe { (*links).left }.unwrap();
+            let child_links = unsafe { Self::links(child) };
+            if unsafe { Self::height((*child_links).left) }
+                < unsafe { Self::height((*child_links).right) }
+            {
+                let rotated = unsafe { Self::rotate_left(child) };
+                unsafe { (*links).left = Some(rotated); }
             }
-            return Self::rotate_right(node);
+            return unsafe { Self::rotate_right(node) };
         }
         if balance < -1 {
-            let child = (*links).right.unwrap();
-            let child_links = Self::links(child);
-            if Self::height((*child_links).right) < Self::height((*child_links).left) {
-                (*links).right = Some(Self::rotate_right(child));
+            let child = unsafe { (*links).right }.unwrap();
+            let child_links = unsafe { Self::links(child) };
+            if unsafe { Self::height((*child_links).right) }
+                < unsafe { Self::height((*child_links).left) }
+            {
+                let rotated = unsafe { Self::rotate_right(child) };
+                unsafe { (*links).right = Some(rotated); }
             }
-            return Self::rotate_left(node);
+            return unsafe { Self::rotate_left(node) };
         }
         node
     }
@@ -181,25 +196,33 @@ impl<T, A: Adapter<T>> AvlTree<T, A> {
             compare: &F,
         ) -> Result<NonNull<T>, InsertError> {
             let Some(root) = root else {
-                (*AvlTree::<T, A>::links(node)).height = 1;
+                let links = unsafe { AvlTree::<T, A>::links(node) };
+                unsafe { (*links).height = 1; }
                 return Ok(node);
             };
-            let links = AvlTree::<T, A>::links(root);
-            match compare(node.as_ref(), root.as_ref()) {
+            let links = unsafe { AvlTree::<T, A>::links(root) };
+            let node_ref = unsafe { node.as_ref() };
+            let root_ref = unsafe { root.as_ref() };
+            match compare(node_ref, root_ref) {
                 Ordering::Less => {
-                    (*links).left = Some(add::<T, A, F>((*links).left, node, compare)?)
+                    let child = unsafe { (*links).left };
+                    let next = unsafe { add::<T, A, F>(child, node, compare)? };
+                    unsafe { (*links).left = Some(next); }
                 }
                 Ordering::Greater => {
-                    (*links).right = Some(add::<T, A, F>((*links).right, node, compare)?)
+                    let child = unsafe { (*links).right };
+                    let next = unsafe { add::<T, A, F>(child, node, compare)? };
+                    unsafe { (*links).right = Some(next); }
                 }
                 Ordering::Equal => return Err(InsertError::DuplicateKey),
             }
-            Ok(AvlTree::<T, A>::balance(root))
+            unsafe { Ok(AvlTree::<T, A>::balance(root)) }
         }
-        if (*Self::links(node)).height != 0 {
+        let links = unsafe { Self::links(node) };
+        if unsafe { (*links).height } != 0 {
             return Err(InsertError::AlreadyLinked);
         }
-        self.root = Some(add::<T, A, F>(self.root, node, &compare)?);
+        self.root = Some(unsafe { add::<T, A, F>(self.root, node, &compare)? });
         Ok(())
     }
 
@@ -224,13 +247,13 @@ impl<T, A: Adapter<T>> AvlTree<T, A> {
     /// `find`. The caller regains exclusive ownership of the selected link.
     pub fn remove<F: Fn(&T) -> Ordering>(&mut self, compare: F) -> Option<NonNull<T>> {
         unsafe fn minimum<T, A: Adapter<T>>(node: NonNull<T>) -> (Option<NonNull<T>>, NonNull<T>) {
-            let links = AvlTree::<T, A>::links(node);
-            if let Some(left) = (*links).left {
-                let (left, found) = minimum::<T, A>(left);
-                (*links).left = left;
-                (Some(AvlTree::<T, A>::balance(node)), found)
+            let links = unsafe { AvlTree::<T, A>::links(node) };
+            if let Some(left) = unsafe { (*links).left } {
+                let (left, found) = unsafe { minimum::<T, A>(left) };
+                unsafe { (*links).left = left; }
+                (Some(unsafe { AvlTree::<T, A>::balance(node) }), found)
             } else {
-                ((*links).right, node)
+                (unsafe { (*links).right }, node)
             }
         }
         unsafe fn take<T, A: Adapter<T>, F: Fn(&T) -> Ordering>(
@@ -239,30 +262,37 @@ impl<T, A: Adapter<T>> AvlTree<T, A> {
             found: &mut Option<NonNull<T>>,
         ) -> Option<NonNull<T>> {
             let root = root?;
-            let links = AvlTree::<T, A>::links(root);
-            match compare(root.as_ref()) {
-                Ordering::Less => (*links).left = take::<T, A, F>((*links).left, compare, found),
+            let links = unsafe { AvlTree::<T, A>::links(root) };
+            let root_ref = unsafe { root.as_ref() };
+            match compare(root_ref) {
+                Ordering::Less => {
+                    let child = unsafe { (*links).left };
+                    let next = unsafe { take::<T, A, F>(child, compare, found) };
+                    unsafe { (*links).left = next; }
+                }
                 Ordering::Greater => {
-                    (*links).right = take::<T, A, F>((*links).right, compare, found)
+                    let child = unsafe { (*links).right };
+                    let next = unsafe { take::<T, A, F>(child, compare, found) };
+                    unsafe { (*links).right = next; }
                 }
                 Ordering::Equal => {
                     *found = Some(root);
-                    let (left, right) = ((*links).left, (*links).right);
-                    links.write(Links::new());
+                    let (left, right) = (unsafe { (*links).left }, unsafe { (*links).right });
+                    unsafe { links.write(Links::new()); }
                     return match (left, right) {
                         (None, right) => right,
                         (left, None) => left,
                         (left, Some(right)) => {
-                            let (right, top) = minimum::<T, A>(right);
-                            let top_links = AvlTree::<T, A>::links(top);
-                            (*top_links).left = left;
-                            (*top_links).right = right;
-                            Some(AvlTree::<T, A>::balance(top))
+                            let (right, top) = unsafe { minimum::<T, A>(right) };
+                            let top_links = unsafe { AvlTree::<T, A>::links(top) };
+                            unsafe { (*top_links).left = left; }
+                            unsafe { (*top_links).right = right; }
+                            Some(unsafe { AvlTree::<T, A>::balance(top) })
                         }
                     };
                 }
             }
-            Some(AvlTree::<T, A>::balance(root))
+            Some(unsafe { AvlTree::<T, A>::balance(root) })
         }
         let mut found = None;
         unsafe { self.root = take::<T, A, F>(self.root, &compare, &mut found) };
@@ -277,10 +307,13 @@ impl<T, A: Adapter<T>> AvlTree<T, A> {
             visit: &mut F,
         ) -> ControlFlow<B> {
             if let Some(node) = node {
-                let links = AvlTree::<T, A>::links(node);
-                walk::<T, A, B, F>((*links).left, visit)?;
-                visit(node.as_ref())?;
-                walk::<T, A, B, F>((*links).right, visit)?;
+                let links = unsafe { AvlTree::<T, A>::links(node) };
+                let left = unsafe { (*links).left };
+                unsafe { walk::<T, A, B, F>(left, visit) }?;
+                let node_ref = unsafe { node.as_ref() };
+                visit(node_ref)?;
+                let right = unsafe { (*links).right };
+                return unsafe { walk::<T, A, B, F>(right, visit) };
             }
             ControlFlow::Continue(())
         }
