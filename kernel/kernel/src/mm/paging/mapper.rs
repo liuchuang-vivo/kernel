@@ -197,6 +197,17 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
         Self::entry_ptr(table, va, P::LEVELS - 1).ok()
     }
 
+    /// Decode the backing PFN of a leaf slot: a live descriptor decodes via
+    /// [`PageFormat::table_address`]; a retired leaf (valid bit clear, kept by
+    /// the NONE reprotect or `release_owned_range` as a no-allocation ledger)
+    /// stores the bare, page-aligned PFN itself. Frame 0 is never allocated, so
+    /// a zero entry still reads as "no mapping".
+    fn recover_pfn(entry: usize) -> Option<usize> {
+        P::table_address(entry).or_else(|| {
+            (entry != 0 && entry & (P::PAGE_SIZE - 1) == 0).then_some(entry)
+        })
+    }
+
     /// Back an exclusively reserved VA range with individually owned frames.
     /// Mapping attributes, backing initialization and translation synchronization
     /// are supplied by the caller. Failure restores an unmapped range.
@@ -377,16 +388,20 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
     /// Rewrite the access attributes of an already-backed leaf range, without
     /// allocating or freeing any frame or changing table structure.
     ///
-    /// Each leaf in `[virt, virt+len)` keeps its backing PFN; only its descriptor
-    /// bits change. A `NONE` attribute (no READ/WRITE/EXECUTE) clears the valid
-    /// bit but retains the PFN, mirroring how [`Self::release_owned_range`]
-    /// retires a leaf, so a later non-NONE reprotect restores access in place.
-    /// Leaves with no backing slot at all (never mapped or already pruned) cause
-    /// an error before any descriptor is written.
+    /// The range is byte granular; permissions apply at page granularity to
+    /// every page `[virt, virt+len)` overlaps, matching how a real MMU can only
+    /// narrow access per page. Each overlapping leaf keeps its backing PFN; only
+    /// its descriptor bits change. A `NONE` attribute (no
+    /// READ/WRITE/EXECUTE) clears the valid bit but retains the PFN, mirroring
+    /// how [`Self::release_owned_range`] retires a leaf, so a later non-NONE
+    /// reprotect restores access in place. Leaves with no backing slot at all
+    /// (never mapped or already pruned) cause an error before any descriptor is
+    /// written.
     ///
     /// # Safety
     /// The caller exclusively owns the range, serializes all walks/updates, and
-    /// guarantees the range is page aligned and valid for this format.
+    /// guarantees every overlapping page is backed by a live or retired leaf of
+    /// this format.
     /// `synchronize` has the same requirements as in [`Self::map_owned_range`]:
     /// it must publish table writes and complete invalidation of all relevant
     /// translations and walk caches before returning, and must not unwind.
@@ -418,29 +433,36 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
         if len == 0 {
             return Ok(());
         }
-        if (start | len) & (P::PAGE_SIZE - 1) != 0 {
-            return Err("reprotect range must be page aligned");
-        }
         if !Self::valid_va(start)
             || !Self::valid_va(end - 1)
             || (start >> P::VIRT_ADDR_BITS) != ((end - 1) >> P::VIRT_ADDR_BITS)
         {
             return Err("reprotect range exceeds address space");
         }
-        // Recover the backing PFN before mutating, so a missing slot fails the
+        // Walk the covered pages, not the raw range: an unaligned start would
+        // otherwise step over a page crossing (e.g. [0x...044, 0x...0a8) must
+        // touch both pages it overlaps).
+        let first = start & !(P::PAGE_SIZE - 1);
+        let last = (end - 1) & !(P::PAGE_SIZE - 1);
+        // Recover the backing PFNs before mutating, so a missing slot fails the
         // whole operation without partial rewrites. A valid leaf carries its
-        // PFN directly; a retired leaf (valid bit clear, PFN retained by
-        // release_owned_range) is recovered by re-asserting the valid bit.
-        for va in (start..end).step_by(P::PAGE_SIZE) {
+        // PFN directly; a retired leaf (valid bit clear, bare PFN retained by
+        // the NONE reprotect or release_owned_range) is the page-aligned PFN
+        // itself and decodes without any descriptor bits.
+        for va in (first..=last).step_by(P::PAGE_SIZE) {
             let slot = self.existing_slot(va).ok_or("no mapping to reprotect")?;
             let entry = unsafe { slot.read() };
-            let pfn = P::table_address(entry)
-                .or_else(|| P::table_address(entry | 1))
+            Self::recover_pfn(entry).ok_or("reprotect target is not a leaf mapping")?;
+        }
+        // A NONE attribute (no READ/WRITE/EXECUTE) writes the bare PFN: the
+        // valid bit stays clear but the PFN is retained, so a later
+        // non-NONE reprotect restores access in place without allocation.
+        // Anything else builds the full descriptor via get_translate.
+        for va in (first..=last).step_by(P::PAGE_SIZE) {
+            let slot = self.existing_slot(va).ok_or("no mapping to reprotect")?;
+            let entry = unsafe { slot.read() };
+            let pfn = Self::recover_pfn(entry)
                 .ok_or("reprotect target is not a leaf mapping")?;
-            // A NONE attribute (no READ/WRITE/EXECUTE) writes the bare PFN: the
-            // valid bit stays clear but the PFN is retained, so a later
-            // non-NONE reprotect restores access in place without allocation.
-            // Anything else builds the full descriptor via get_translate.
             let new_desc = if has_access {
                 P::get_translate(pfn, attributes, false)
             } else {

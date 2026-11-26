@@ -175,26 +175,29 @@ impl ImageMapping for AddressSpaceImageMapping {
         let len =
             u64::try_from(dst.len()).map_err(|_| memory_access_error(self, offset, u64::MAX))?;
         let source = self.translate_offset(offset, len)?;
-        self.aspace
-            .read_image(source, dst)
-            .map_err(|_| memory_access_error(self, offset, len))
+        self.aspace.read_image(source, dst).map_err(|e| {
+            log::warn!("read_image({:#x}, {}): {:?}", source, len, e);
+            memory_access_error(self, offset, len)
+        })
     }
 
     fn write(&mut self, offset: AllocationOffset, data: &[u8]) -> LoadResult<()> {
         let len =
             u64::try_from(data.len()).map_err(|_| memory_access_error(self, offset, u64::MAX))?;
         let destination = self.translate_offset(offset, len)?;
-        self.aspace
-            .write_image(destination, data)
-            .map_err(|_| memory_access_error(self, offset, len))
+        self.aspace.write_image(destination, data).map_err(|e| {
+            log::warn!("write_image({:#x}, {}): {:?}", destination, len, e);
+            memory_access_error(self, offset, len)
+        })
     }
 
     fn zero(&mut self, offset: AllocationOffset, len: u64) -> LoadResult<()> {
         let destination = self.translate_offset(offset, len)?;
         let count = usize::try_from(len).map_err(|_| memory_access_error(self, offset, len))?;
-        self.aspace
-            .zero_image(destination, count)
-            .map_err(|_| memory_access_error(self, offset, len))
+        self.aspace.zero_image(destination, count).map_err(|e| {
+            log::warn!("zero_image({:#x}, {}): {:?}", destination, count, e);
+            memory_access_error(self, offset, len)
+        })
     }
 
     fn protection_level(&self) -> ProtectionLevel {
@@ -209,9 +212,11 @@ impl ImageMapping for AddressSpaceImageMapping {
     ) -> LoadResult<()> {
         let start = self.translate_offset(offset, len)?;
         let count = usize::try_from(len).map_err(|_| memory_access_error(self, offset, len))?;
-        self.aspace
-            .protect_image(start, count, to_mem_flags(permissions))
-            .map_err(|_| memory_access_error(self, offset, len))
+        let flags = to_mem_flags(permissions);
+        self.aspace.protect_image(start, count, flags).map_err(|e| {
+            log::warn!("protect_image({:#x}, {}, {:?}): {:?}", start, count, flags, e);
+            memory_access_error(self, offset, len)
+        })
     }
 }
 

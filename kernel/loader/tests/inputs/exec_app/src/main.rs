@@ -15,6 +15,8 @@
 #![no_main]
 #![no_std]
 
+use blueos_header::syscalls::NR::ExitThread;
+use blueos_scal::bk_syscall;
 use core::ptr::{addr_of, addr_of_mut};
 
 const INITIAL_VALUE: u32 = 0x1357_2468;
@@ -29,12 +31,26 @@ pub extern "C" fn _start() -> u32 {
     unsafe {
         let initialized = addr_of!(INITIALIZED).read_volatile();
         let zeroed = addr_of!(ZEROED).read_volatile();
-        if initialized != INITIAL_VALUE || zeroed != 0 {
-            return 0;
-        }
-        addr_of_mut!(ZEROED).write_volatile(WRITTEN_VALUE);
-        initialized ^ addr_of!(ZEROED).read_volatile()
+        let result = if initialized != INITIAL_VALUE || zeroed != 0 {
+            0
+        } else {
+            addr_of_mut!(ZEROED).write_volatile(WRITTEN_VALUE);
+            initialized ^ addr_of!(ZEROED).read_volatile()
+        };
+        // Don't return: the kernel forges the initial user context without a
+        // meaningful LR, so a plain `ret` would fault fetching at VA 0.
+        // Terminate through the kernel's syscall interface instead; the result
+        // rides in x0 for the kernel-side exit handler.
+        exit_thread(result)
     }
+}
+
+/// Terminate the thread with the `NR::ExitThread` syscall, issued from EL0
+/// through `blueos_scal`'s `bk_syscall!` (the `svc` lives in
+/// `platform::syscall1`, the single sanctioned trap site).
+fn exit_thread(result: u32) -> ! {
+    bk_syscall!(ExitThread, result as usize);
+    unreachable!("ExitThread should not return");
 }
 
 #[panic_handler]

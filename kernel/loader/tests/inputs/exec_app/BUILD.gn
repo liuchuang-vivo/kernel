@@ -57,6 +57,10 @@ build_rust("loader_test_app") {
   testonly = true
   crate_type = "bin"
   sources = [ "src/main.rs" ]
+  deps = [
+    "//kernel/header:blueos_header",
+    "//kernel/scal:blueos_scal_swi",
+  ]
   build_deps = [ ":gen_loader_test_relocation" ]
   configs += [ "//build/boards/${board}:app_config" ]
   linker_script = _loader_test_linker_script
@@ -72,6 +76,10 @@ build_rust("loader_test_app") {
 build_rust("boot_exec_app") {
   crate_type = "bin"
   sources = [ "src/main.rs" ]
+  deps = [
+    "//kernel/header:blueos_header",
+    "//kernel/scal:blueos_scal_swi",
+  ]
   build_deps = [ ":gen_loader_test_relocation" ]
   configs += [ "//build/boards/${board}:app_config" ]
   linker_script = _loader_test_linker_script

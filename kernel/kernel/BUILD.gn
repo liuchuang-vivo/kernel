@@ -233,6 +233,38 @@ cbindgen("rust_wrapper") {
          rebase_path([ "." ], root_build_dir)
 }
 
+# Pre-populated FAT image carrying the first user ELF as `/fat/exec_app.elf` on
+# the QEMU block device. Only the aarch64 virt board has the paging + VFS +
+# fatfs + virtio-blk pipeline that makes a populated FAT meaningful; other
+# boards skip this and the runner falls back to the legacy empty-block path.
+#
+# Under the current `include_bytes!` interim (see `boot::init_user_app` and the
+# `EXEC_APP_ELF` static), the booted kernel embeds the ELF bytes directly and
+# does NOT read `/fat/exec_app.elf`; this image is staged for the eventual
+# VFS-read end state, at which point `init_user_app` switches from the embedded
+# static to `open_path("/fat/exec_app.elf")`.
+#
+# `exe` points at the non-testonly `boot_exec_app` twin rather than the
+# testonly `loader_test_app`: `gen_fat_image` does not forward `testonly` from
+# its invoker, so `user_app_fat` is non-testonly and GN forbids it from
+# depending on a testonly producer. `boot_exec_app` is byte-identical to
+# `loader_test_app` (same main.rs/linker/rustflags), so the shipped image is
+# unchanged. `exe_dst` decouples the runtime name (`/fat/exec_app.elf`) from
+# the build target name.
+if (board == "qemu_virt64_aarch64") {
+  gen_fat_image("user_app_fat") {
+    exe = "//kernel/loader/tests/inputs/exec_app:boot_exec_app"
+    exe_dst = "exec_app.elf"
+    # FAT16 needs >= 4085 data clusters (rust-fatfs derives FatType from the
+    # cluster count, ignoring the BPB FilSysType string). At 4096-byte clusters
+    # a 4MiB image has only 1023 clusters -> read as FAT12 -> the 16-bit FAT
+    # entries we write are misdecoded as 12-bit packed entries -> alloc_cluster
+    # fails on mkdir -> test_vfs panics. 32MiB yields ~8183 clusters, solidly
+    # FAT16. gen_fat_image.py enforces the >= 4085 floor defensively.
+    size = "32MiB"
+  }
+}
+
 if (defined(qemu_use_esp32_loader) && qemu_use_esp32_loader) {
   gen_esp32_qemu_runner("integration_test_runner") {
     testonly = true

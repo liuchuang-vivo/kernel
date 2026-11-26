@@ -296,7 +296,10 @@ impl<F: FrameAllocator> AddressSpaceState<F> {
                 || {},
             )
         }
-        .map_err(|_| error::code::EIO)
+        .map_err(|e| {
+            log::warn!("reprotect_range({:#x}, {}, {:?}): {}", start, len, flags, e);
+            error::code::EIO
+        })
     }
 
     /// Read bytes from a loaded image range into a kernel buffer, checking the
