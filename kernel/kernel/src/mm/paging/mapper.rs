@@ -374,6 +374,84 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
         }
     }
 
+    /// Rewrite the access attributes of an already-backed leaf range, without
+    /// allocating or freeing any frame or changing table structure.
+    ///
+    /// Each leaf in `[virt, virt+len)` keeps its backing PFN; only its descriptor
+    /// bits change. A `NONE` attribute (no READ/WRITE/EXECUTE) clears the valid
+    /// bit but retains the PFN, mirroring how [`Self::release_owned_range`]
+    /// retires a leaf, so a later non-NONE reprotect restores access in place.
+    /// Leaves with no backing slot at all (never mapped or already pruned) cause
+    /// an error before any descriptor is written.
+    ///
+    /// # Safety
+    /// The caller exclusively owns the range, serializes all walks/updates, and
+    /// guarantees the range is page aligned and valid for this format.
+    /// `synchronize` has the same requirements as in [`Self::map_owned_range`]:
+    /// it must publish table writes and complete invalidation of all relevant
+    /// translations and walk caches before returning, and must not unwind.
+    pub(crate) unsafe fn reprotect_range(
+        &mut self,
+        virt: VirtualAddress,
+        len: usize,
+        attributes: MemAttribute,
+        mut synchronize: impl FnMut(),
+    ) -> Result<(), &'static str> {
+        // NONE (no READ/WRITE/EXECUTE) is the legitimate revoke-access case
+        // requested by the loader's whole-range `set_permissions(.., NONE)` step
+        // before it narrows per-segment access. The full `validate_attributes`
+        // requires READ, which would reject NONE; only enforce the exclusions
+        // that matter here — W|X is rejected, device memory is never executable.
+        // Those are vacuous for NONE (no X bit set), so NONE always passes.
+        let has_access = attributes
+            .flags
+            .intersects(MemFlags::READ | MemFlags::WRITE | MemFlags::EXECUTE);
+        if has_access {
+            Self::validate_attributes(attributes)?;
+        } else if matches!(attributes.memory_type, MemType::Device)
+            && attributes.flags.contains(MemFlags::EXECUTE)
+        {
+            return Err("device memory cannot be executable");
+        }
+        let start = virt.into_raw();
+        let end = start.checked_add(len).ok_or("reprotect range overflow")?;
+        if len == 0 {
+            return Ok(());
+        }
+        if (start | len) & (P::PAGE_SIZE - 1) != 0 {
+            return Err("reprotect range must be page aligned");
+        }
+        if !Self::valid_va(start)
+            || !Self::valid_va(end - 1)
+            || (start >> P::VIRT_ADDR_BITS) != ((end - 1) >> P::VIRT_ADDR_BITS)
+        {
+            return Err("reprotect range exceeds address space");
+        }
+        // Recover the backing PFN before mutating, so a missing slot fails the
+        // whole operation without partial rewrites. A valid leaf carries its
+        // PFN directly; a retired leaf (valid bit clear, PFN retained by
+        // release_owned_range) is recovered by re-asserting the valid bit.
+        for va in (start..end).step_by(P::PAGE_SIZE) {
+            let slot = self.existing_slot(va).ok_or("no mapping to reprotect")?;
+            let entry = unsafe { slot.read() };
+            let pfn = P::table_address(entry)
+                .or_else(|| P::table_address(entry | 1))
+                .ok_or("reprotect target is not a leaf mapping")?;
+            // A NONE attribute (no READ/WRITE/EXECUTE) writes the bare PFN: the
+            // valid bit stays clear but the PFN is retained, so a later
+            // non-NONE reprotect restores access in place without allocation.
+            // Anything else builds the full descriptor via get_translate.
+            let new_desc = if has_access {
+                P::get_translate(pfn, attributes, false)
+            } else {
+                pfn
+            };
+            unsafe { slot.write(new_desc); }
+        }
+        synchronize();
+        Ok(())
+    }
+
     fn validate_attributes(attributes: MemAttribute) -> Result<(), &'static str> {
         if attributes
             .flags

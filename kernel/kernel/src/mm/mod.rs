@@ -17,6 +17,16 @@ pub mod address_space;
 mod mem_attribute;
 pub use mem_attribute::{CachePolicy, MemAttribute, MemFlags, MemType};
 
+#[cfg(all(paging, enable_vfs))]
+mod elf_reader;
+#[cfg(all(paging, enable_vfs))]
+pub use elf_reader::VfsElfReader;
+
+#[cfg(paging)]
+mod image_allocator;
+#[cfg(paging)]
+pub use image_allocator::{AddressSpaceImageAllocator, AddressSpaceImageMapping};
+
 #[cfg(paging)]
 pub mod kernel_space;
 pub mod memory_bank;

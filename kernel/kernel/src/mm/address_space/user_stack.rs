@@ -182,6 +182,258 @@ impl<F: FrameAllocator> AddressSpaceState<F> {
     }
 }
 
+impl<F: FrameAllocator> AddressSpaceState<F> {
+    /// Find the lowest `align`-aligned, `len`-sized free hole in
+    /// `[floor, ceil)`. `len` and `align` must be nonzero page multiples.
+    /// Returns the hole start, or `None` if no such hole fits.
+    pub(super) fn find_free_range(
+        &self,
+        floor: usize,
+        ceil: usize,
+        len: usize,
+        align: usize,
+    ) -> Option<usize> {
+        if len == 0 || align == 0 || !align.is_power_of_two() {
+            return None;
+        }
+        let mut cursor = floor.checked_add(align - 1)? & !(align - 1);
+        while cursor <= ceil.checked_sub(len)? {
+            let end = cursor.checked_add(len)?;
+            // The first VMA whose start is >= cursor bounds this hole on the
+            // right; any VMA overlapping [cursor, end) forces a skip past it.
+            let conflict = self
+                .vmas
+                .range(cursor..end)
+                .next()
+                .map(|(start, vma)| (*start, vma.end()));
+            match conflict {
+                None => return Some(cursor),
+                Some((vma_start, vma_end)) => {
+                    // Resume scanning at the end of the conflicting VMA,
+                    // re-aligned upward.
+                    cursor = vma_end.max(vma_start.checked_add(1)?);
+                    cursor = cursor.checked_add(align - 1)? & !(align - 1);
+                }
+            }
+        }
+        None
+    }
+
+    /// Back an exclusively reserved `[start, start+len)` image range with
+    /// zeroed, user read/write frames and register its VMA. The table stays
+    /// inactive. On failure no VMA or mapping is left behind.
+    pub(super) fn load_image_range(
+        &mut self,
+        start: usize,
+        len: usize,
+        flags: MemFlags,
+    ) -> Result<(), error::Error> {
+        let end = start.checked_add(len).ok_or(error::code::EINVAL)?;
+        if AddressSpace::overlaps(&self.vmas, start, end) {
+            return Err(error::code::EEXIST);
+        }
+        let vma = Vma::new(start, end, flags)?;
+        self.vmas.insert(start, vma);
+        // SAFETY: the caller serialized this state, the range was just reserved
+        // exclusively, has no users, and this table was never active.
+        let mapped = unsafe {
+            self.mapper.map_owned_range(
+                VirtualAddress::new(start),
+                len,
+                MemAttribute {
+                    flags,
+                    memory_type: MemType::Normal(CachePolicy::WriteBack),
+                },
+                FrameInit::Zeroed,
+                || {},
+            )
+        };
+        if mapped.is_err() {
+            self.vmas.remove(&start);
+            return Err(error::code::ENOMEM);
+        }
+        Ok(())
+    }
+
+    /// Release a loaded image range: retire its mappings and drop its VMA.
+    pub(super) fn release_image(&mut self, start: usize, len: usize) {
+        // SAFETY: the caller exclusively owns this range and serializes the
+        // state; tables have never been active.
+        unsafe {
+            self.mapper
+                .release_owned_range(VirtualAddress::new(start), len, || {});
+        }
+        self.vmas.remove(&start);
+    }
+
+    /// Rewrite the access attributes of a loaded image range in place.
+    /// `flags` with no READ/WRITE/EXECUTE revokes access (NONE) while retaining
+    /// backing; otherwise the range becomes accessible with `flags`.
+    ///
+    /// The image is backed by one VMA spanning the whole allocation, while this
+    /// call narrows per-segment sub-ranges. The VMA is a bounds reservation, not
+    /// a per-page permission record: the page table is the live authority, and
+    /// `translate` (used by read/write/zero) succeeds only while a leaf is valid.
+    /// So the VMA's flags are left at the loader's initial READ|WRITE|USER and
+    /// are not rewritten here — `validate_image_read`/`validate_image_write`
+    /// additionally require a valid leaf on every page, which is the real gate.
+    pub(super) fn protect_image(
+        &mut self,
+        start: usize,
+        len: usize,
+        flags: MemFlags,
+    ) -> Result<(), error::Error> {
+        // SAFETY: the caller serializes this state and exclusively owns the
+        // range; the table is inactive.
+        unsafe {
+            self.mapper.reprotect_range(
+                VirtualAddress::new(start),
+                len,
+                MemAttribute {
+                    flags,
+                    memory_type: MemType::Normal(CachePolicy::WriteBack),
+                },
+                || {},
+            )
+        }
+        .map_err(|_| error::code::EIO)
+    }
+
+    /// Read bytes from a loaded image range into a kernel buffer, checking the
+    /// source VMA and every backing page before reading. Mirrors `write_image`.
+    /// The page table is the live permission authority: a `translate` succeeds
+    /// only while a leaf is valid, so a NONE-revoked range correctly rejects
+    /// reads even though the backing PFN is retained.
+    pub(super) fn read_image(
+        &self,
+        source: usize,
+        bytes: &mut [u8],
+    ) -> Result<(), error::Error> {
+        self.validate_image_read(source, bytes.len())?;
+        let mut copied = 0;
+        while copied < bytes.len() {
+            let va = source + copied;
+            let len = (PageEntry::PAGE_SIZE - va % PageEntry::PAGE_SIZE).min(bytes.len() - copied);
+            let physical = self.mapper.translate(va).expect("validated image page");
+            let src = kernel_phys_to_virt(physical).into_raw() as *const u8;
+            // SAFETY: validation restricts the complete source to live, valid
+            // image backing. The state lock excludes other walkers; no user
+            // thread can access this inactive space. Both slices are in bounds.
+            unsafe { core::ptr::copy(src, bytes.as_mut_ptr().add(copied), len) };
+            copied += len;
+        }
+        Ok(())
+    }
+
+    /// Copy kernel bytes into a loaded image range, checking the destination
+    /// VMA and every backing page before writing. Mirrors `write_user_stack`.
+    pub(super) fn write_image(
+        &mut self,
+        destination: usize,
+        bytes: &[u8],
+    ) -> Result<(), error::Error> {
+        self.validate_image_write(destination, bytes.len())?;
+        let mut copied = 0;
+        while copied < bytes.len() {
+            let va = destination + copied;
+            let len = (PageEntry::PAGE_SIZE - va % PageEntry::PAGE_SIZE).min(bytes.len() - copied);
+            let physical = self.mapper.translate(va).expect("validated image page");
+            let target = kernel_phys_to_virt(physical).into_raw() as *mut u8;
+            // SAFETY: validation restricts the complete destination to live,
+            // exclusively owned image backing. The state lock excludes other
+            // walkers/writers; no user thread can access this inactive space.
+            // The source slice is kernel memory and both chunks are in bounds.
+            unsafe { core::ptr::copy(bytes.as_ptr().add(copied), target, len) };
+            copied += len;
+        }
+        Ok(())
+    }
+
+    /// Zero `len` bytes of a loaded image range starting at `destination`.
+    pub(super) fn zero_image(
+        &mut self,
+        destination: usize,
+        len: usize,
+    ) -> Result<(), error::Error> {
+        self.validate_image_write(destination, len)?;
+        let mut zeroed = 0;
+        while zeroed < len {
+            let va = destination + zeroed;
+            let chunk = (PageEntry::PAGE_SIZE - va % PageEntry::PAGE_SIZE).min(len - zeroed);
+            let physical = self.mapper.translate(va).expect("validated image page");
+            let target = kernel_phys_to_virt(physical).into_raw() as *mut u8;
+            // SAFETY: same exclusivity and validation as write_image.
+            unsafe { core::ptr::write_bytes(target, 0, chunk) };
+            zeroed += chunk;
+        }
+        Ok(())
+    }
+
+    /// Validate every destination page before an image write. The caller holds
+    /// the state lock across this check and the copy, so mappings cannot vanish.
+    fn validate_image_write(
+        &self,
+        destination: usize,
+        len: usize,
+    ) -> Result<(), error::Error> {
+        if len == 0 {
+            return Ok(());
+        }
+        let end = destination.checked_add(len).ok_or(error::code::EINVAL)?;
+        let vma = self
+            .vmas
+            .range(..=destination)
+            .next_back()
+            .map(|(_, vma)| *vma)
+            .filter(|vma| vma.contains(destination) && vma.end() >= end)
+            .ok_or(error::code::EIO)?;
+        if !vma
+            .flags()
+            .contains(MemFlags::READ | MemFlags::WRITE | MemFlags::USER)
+        {
+            return Err(error::code::EIO);
+        }
+        let mut cursor = destination;
+        while cursor < end {
+            self.mapper.translate(cursor).ok_or(error::code::EIO)?;
+            cursor += (PageEntry::PAGE_SIZE - cursor % PageEntry::PAGE_SIZE).min(end - cursor);
+        }
+        Ok(())
+    }
+
+    /// Validate every source page before an image read. The caller holds the
+    /// state lock across this check and the copy, so mappings cannot vanish.
+    /// The VMA must cover the range and be a user image mapping; the page table
+    /// is the live permission authority, so a valid leaf (`translate` succeeds)
+    /// is required on every page — a NONE-revoked page correctly fails here.
+    fn validate_image_read(
+        &self,
+        source: usize,
+        len: usize,
+    ) -> Result<(), error::Error> {
+        if len == 0 {
+            return Ok(());
+        }
+        let end = source.checked_add(len).ok_or(error::code::EINVAL)?;
+        let vma = self
+            .vmas
+            .range(..=source)
+            .next_back()
+            .map(|(_, vma)| *vma)
+            .filter(|vma| vma.contains(source) && vma.end() >= end)
+            .ok_or(error::code::EIO)?;
+        if !vma.flags().contains(MemFlags::READ | MemFlags::USER) {
+            return Err(error::code::EIO);
+        }
+        let mut cursor = source;
+        while cursor < end {
+            self.mapper.translate(cursor).ok_or(error::code::EIO)?;
+            cursor += (PageEntry::PAGE_SIZE - cursor % PageEntry::PAGE_SIZE).min(end - cursor);
+        }
+        Ok(())
+    }
+}
+
 impl<F: FrameAllocator> Drop for AddressSpaceState<F> {
     fn drop(&mut self) {
         if let Some(layout) = self.user_stack.take() {

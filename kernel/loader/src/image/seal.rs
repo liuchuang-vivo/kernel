@@ -46,6 +46,14 @@ impl<A: ImageMapping> SealedImage<A> {
         &self.allocation
     }
 
+    /// Consume the sealed image and take ownership of its mapping.
+    ///
+    /// Used by [`crate::load`] to move the allocation into the public
+    /// [`crate::LoadedImage`] without exposing the sealed stage's other fields.
+    pub(crate) fn into_allocation(self) -> A {
+        self.allocation
+    }
+
     pub(crate) const fn entry(&self) -> Option<TargetAddress> {
         self.entry
     }
