@@ -13,6 +13,8 @@
 // limitations under the License.
 
 pub(crate) mod asm;
+#[cfg(paging)]
+pub(crate) mod cache;
 pub(crate) mod cpu;
 mod exception;
 pub mod irq;
@@ -22,6 +24,9 @@ pub(crate) mod page;
 pub(crate) mod psci;
 pub(crate) mod vector;
 pub(crate) mod virt;
+
+#[cfg(paging)]
+pub use cache::Aarch64CodeCache;
 
 use crate::{
     mm::{PhysicalAddress, VirtualAddress},
@@ -111,8 +116,14 @@ macro_rules! enter_el1 {
         adrp x2, {cont}
         add x2, x2, :lo12:{cont}
         add x2, x2, x12
-        // adr is PC-relative
-        adr x3, {entry}
+        // `adrp`+`:lo12:` instead of `adr` for distance-independence: in
+        // large builds (notably the `kernel_unittest` test binary, whose
+        // monomorphized generics push `_start` and `jump_to_high_va` >1MB
+        // apart) the ±1MB range of `R_AARCH64_ADR_PREL_LO21` overflows.
+        // `adrp` resolves to the same PC-relative physical address as `adr`
+        // (the identity mapping is still live here) but tolerates ±4GB.
+        adrp x3, {entry}
+        add x3, x3, :lo12:{entry}
         msr elr_el2, x3
         eret
         "
