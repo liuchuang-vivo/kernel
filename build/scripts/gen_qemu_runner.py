@@ -23,6 +23,17 @@ rm -f {block_img}
 dd if=/dev/zero of={block_img} bs=1M count={block_size}
 """
 
+# A pre-populated block image (e.g. a FAT image produced at build time by
+# `gen_fat_image`) is used verbatim: no `dd`, so build-time content survives to
+# boot. The path is already on disk when the runner script runs.
+USE_PREBUILT_BLOCK_IMG = r"""
+# Pre-populated block image supplied at build time; use verbatim (no dd).
+if [ ! -f {block_img} ]; then
+  echo "error: prebuilt block image not found: {block_img}" >&2
+  exit 1
+fi
+"""
+
 TEST = r"""
 exec {qemu} {semihosting} -M {machine} {qemu_args} {block_args} {net_args} -kernel {image} -nographic -serial \
        file:{logfile} -d int,cpu_reset,guest_errors,unimp -D {syslog}
@@ -50,13 +61,26 @@ def do_gen(config, template, suffix='', need_log=False):
         f.write(r"#!/bin/bash")
 
         block_args = ''
-        if config.block_img:
+        if config.prebuilt_block_img:
+            # Build-time FAT image: verify presence and use verbatim. The path
+            # is already absolute (rebased by the GN template). `snapshot=on`
+            # redirects writes to a per-QEMU temporary overlay so the shared
+            # build-time image needs no exclusive write lock — without this,
+            # `run_unittest` and `run_integration_test` (both shipping the same
+            # `user_app_fat.img`) fail to start in parallel with "Failed to get
+            # 'write' lock". Each test's writes (e.g. the VFS `mkdir` tests)
+            # stay isolated to its own overlay.
+            f.write(
+                USE_PREBUILT_BLOCK_IMG.format(
+                    block_img=config.prebuilt_block_img))
+            block_args += f'-drive file={config.prebuilt_block_img},if=none,format=raw,snapshot=on,id=hd'
+        elif config.block_img:
             dirname = os.path.dirname(config.block_img)
             os.makedirs(dirname, exist_ok=True)
             f.write(
                 GEN_BLOCK_IMG.format(block_img=config.block_img,
                                      block_size=config.block_size))
-            block_args += f'-drive file={config.block_img},if=none,format=raw,id=hd'
+            block_args += f'-drive file={config.block_img},if=none,format=raw,snapshot=on,id=hd'
 
         if config.block_args:
             block_args += ' ' + config.block_args
@@ -112,6 +136,10 @@ def main():
     parser.add_argument("--out_dir", help="Output directory", required=True)
     parser.add_argument("--qemu_args", help="Extra qmeu args", default="")
     parser.add_argument("--block_img", help="Add block image", default="")
+    parser.add_argument("--prebuilt_block_img",
+                        help="Use a pre-populated block image verbatim "
+                             "(no dd); content placed at build time survives",
+                        default="")
     parser.add_argument("--block_size",
                         help="Specify block image size",
                         default=32)

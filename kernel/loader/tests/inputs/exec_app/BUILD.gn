@@ -29,8 +29,11 @@ assert(defined(loader_test_relocation.permissions),
 _loader_test_linker_script_template = "link.x.template"
 _loader_test_linker_script = "${target_gen_dir}/loader_test_relocation_link.x"
 
+# Generates the linker script from `loader_test_relocation`. Not test-scoped:
+# the script generation is mechanical (region/origin/length substitution) and is
+# shared by `loader_test_app`, whose ELF is also the image the kernel's first
+# user process loads from `/fat/exec_app.elf` via the VFS.
 action("gen_loader_test_relocation") {
-  testonly = true
   script = "//kernel/loader/tests/scripts/gen_loader_test_relocation.py"
   inputs = [ _loader_test_linker_script_template ]
   args = [
@@ -52,6 +55,21 @@ action("gen_loader_test_relocation") {
 
 build_rust("loader_test_app") {
   testonly = true
+  crate_type = "bin"
+  sources = [ "src/main.rs" ]
+  build_deps = [ ":gen_loader_test_relocation" ]
+  configs += [ "//build/boards/${board}:app_config" ]
+  linker_script = _loader_test_linker_script
+  rustflags = [
+    "-Cpanic=abort",
+    "-Crelocation-model=static",
+    "-Clink-arg=-Wl,-static",
+    "-Clink-arg=-Wl,--no-pie",
+    "-Clink-arg=-nostartfiles",
+  ]
+}
+
+build_rust("boot_exec_app") {
   crate_type = "bin"
   sources = [ "src/main.rs" ]
   build_deps = [ ":gen_loader_test_relocation" ]

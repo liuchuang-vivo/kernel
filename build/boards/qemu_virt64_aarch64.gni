@@ -14,6 +14,19 @@
 
 board_default_toolchain = "blueos_aarch64"
 default_linker_script = "${root_gen_dir}/link.pre.ld"
+
+# User ELF image load region for `exec_app` (W7 first user process). ET_EXEC, so
+# the link-time VA is the runtime PC. Lives in low-VA user space (TTBR0), which
+# is disjoint from the high-VA kernel (TTBR1), so it never collides with the
+# kernel image regardless of where the kernel is loaded. 1 MiB is ample for the
+# tiny exec_app payload. Mirrors the same knob `seeed_xiao_esp32c3.gni` defines.
+loader_test_relocation = {
+  region = "RAM"
+  origin = "0x40280000"
+  length = "0x100000"
+  permissions = "rwx"
+}
+
 qemu_exe = "qemu-system-aarch64"
 qemu_machine = "virt,virtualization=on,gic-version=3"
 
