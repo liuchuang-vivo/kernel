@@ -69,6 +69,7 @@ _shared_deps = [
   "//kernel/infra:blueos_infra",
   "//kernel/kconfig:blueos_kconfig",
   "//kernel/kconfig:generate_rustflags_file",
+  "//kernel/loader:blueos_loader",
   "//libs/libc",
 ]
 
@@ -94,6 +95,25 @@ _loader_backend_enabled = board_toolchain_info.current_cpu == "riscv32" ||
 if (_loader_backend_enabled) {
   _kernel_default_cfgs += [ "loader_backend" ]
   _shared_deps += [ "//kernel/loader:blueos_loader" ]
+}
+
+# Embed the first user ELF (`exec_app`) directly into the kernel image via
+# `include_bytes!` so `boot::init_user_app` can validate the spawn chain without
+# the FAT/virtio/VFS pipeline. Only the aarch64 virt board does this: it is the
+# only board with paging + a user-mode entry path wired end to end. The path is
+# resolved to the linked binary (`root_out_dir/bin/boot_exec_app`, the same
+# convention `postlink_action`/`gen_fat_image` use) and surfaced to rustc two
+# ways: as an `inputs` entry (so a changed ELF recompiles `blueos`) and as the
+# `EXEC_APP_ELF_PATH` rustenv var (read by `env!` in `boot.rs` to feed
+# `include_bytes!`). `boot_exec_app` is the non-testonly twin of
+# `loader_test_app`; `blueos` is not testonly, so it cannot depend on the
+# testonly original. Defined before both `kernel_unittest` and `blueos` so each
+# can graft the ELF path into its rustenv under the same gate.
+_exec_app_embed_enabled = board == "qemu_virt64_aarch64"
+if (_exec_app_embed_enabled) {
+  _exec_app_label = "//kernel/loader/tests/inputs/exec_app:boot_exec_app"
+  _exec_app_path =
+      get_label_info(_exec_app_label, "root_out_dir") + "/bin/boot_exec_app"
 }
 
 build_rust("kernel_unittest") {
@@ -183,8 +203,15 @@ build_rust("blueos") {
     "//kernel/macro:blueos_macro",
   ]
   rustenv = [ "TARGET_BOARD=${board}" ]
+  if (_exec_app_embed_enabled) {
+    rustenv += [ "EXEC_APP_ELF_PATH=" + rebase_path(_exec_app_path) ]
+  }
   cfgs = _kernel_default_cfgs
   deps = _shared_deps
+  if (_exec_app_embed_enabled) {
+    deps += [ _exec_app_label ]
+    inputs = [ _exec_app_path ]
+  }
   public_deps = board_deps
   public_deps += [ "//kernel/kconfig:generate_rustflags_file" ]
   public_configs += [
@@ -231,6 +258,10 @@ if (defined(qemu_use_esp32_loader) && qemu_use_esp32_loader) {
     net_args = qemu_net_args
     block_img = "integration_test_block.img"
     block_args = qemu_block_args
+    if (board == "qemu_virt64_aarch64") {
+      # Ship the populated FAT (with /fat/exec_app.elf) instead of an empty disk.
+      prebuilt_block_img = ":user_app_fat"
+    }
   }
 }
 
@@ -274,6 +305,10 @@ if (defined(use_defmt) && use_defmt) {
     block_img = "unittest_block.img"
     block_args = qemu_block_args
     semihosting = true
+    if (board == "qemu_virt64_aarch64") {
+      # Ship the populated FAT (with /fat/exec_app.elf) instead of an empty disk.
+      prebuilt_block_img = ":user_app_fat"
+    }
   }
 }
 
