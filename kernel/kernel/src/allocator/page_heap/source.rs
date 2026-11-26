@@ -147,22 +147,22 @@ unsafe fn release_metadata(
     allocator: &FirstFitFrameAllocator,
     mapping: *mut Mapping,
 ) {
-    let page = (*mapping).pool;
+    let page = unsafe { (*mapping).pool };
     let slot = (mapping as usize - page - SLOT_OFFSET) / size_of::<Mapping>();
     let empty = {
         let mut head = state.pool.irqsave_lock();
-        let h = &mut *(page as *mut PoolPage);
+        let h = unsafe { &mut *(page as *mut PoolPage) };
         assert!(slot < SLOTS && h.occupied & (1u64 << slot) != 0);
-        core::ptr::drop_in_place(mapping);
+        unsafe { core::ptr::drop_in_place(mapping); }
         h.occupied &= !(1u64 << slot);
         if h.occupied == 0 {
             if h.prev == 0 {
                 *head = h.next;
             } else {
-                (*(h.prev as *mut PoolPage)).next = h.next;
+                unsafe { (*(h.prev as *mut PoolPage)).next = h.next; }
             }
             if h.next != 0 {
-                (*(h.next as *mut PoolPage)).prev = h.prev;
+                unsafe { (*(h.next as *mut PoolPage)).prev = h.prev; }
             }
             true
         } else {
@@ -170,9 +170,11 @@ unsafe fn release_metadata(
         }
     };
     if empty {
-        allocator
-            .free_frame(PhysicalAddress::new(page - KERNEL_VIRT_OFFSET))
-            .expect("release mapping metadata");
+        unsafe {
+            allocator
+                .free_frame(PhysicalAddress::new(page - KERNEL_VIRT_OFFSET))
+                .expect("release mapping metadata");
+        }
     }
 }
 
@@ -266,21 +268,25 @@ unsafe impl PageSource for VmapSource {
 
     unsafe fn release(&self, span: PageSpan) {
         let node = span.area().expect("mapped span descriptor");
-        assert!(node.as_ref().detached(), "object heap still owns mapping");
-        KernelAddressSpace::get()
-            .expect("kernel space")
-            .release_heap(span.start().as_ptr().addr(), span.pages());
+        assert!(unsafe { node.as_ref().detached() }, "object heap still owns mapping");
+        unsafe {
+            KernelAddressSpace::get()
+                .expect("kernel space")
+                .release_heap(span.start().as_ptr().addr(), span.pages());
+        }
         assert_eq!(
             VMAP.areas
                 .irqsave_lock()
                 .remove(span.start().as_ptr().addr()),
             Some(node)
         );
-        release_metadata(
-            &VMAP,
-            FirstFitFrameAllocator::instance(),
-            node.as_ptr().cast::<Mapping>(),
-        );
+        unsafe {
+            release_metadata(
+                &VMAP,
+                FirstFitFrameAllocator::instance(),
+                node.as_ptr().cast::<Mapping>(),
+            );
+        }
     }
     fn frame_stats(&self) -> FrameStats {
         FirstFitFrameAllocator::instance()

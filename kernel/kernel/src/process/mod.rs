@@ -379,7 +379,8 @@ impl Process {
             return false;
         }
         if let Some(t) = list.back() {
-            t.lock().set_process(weak);
+            let mut t = t.lock();
+            t.set_process(weak);
         }
         true
     }

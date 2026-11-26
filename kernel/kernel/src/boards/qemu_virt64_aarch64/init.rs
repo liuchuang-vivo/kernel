@@ -38,20 +38,19 @@ const NUM_CORES: usize = blueos_kconfig::CONFIG_NUM_CORES as usize;
 pub(crate) fn init() {
     STAGING.run(0, true, crate::boot::init_runtime);
     STAGING.run(1, true, || {
-        cfg_if::cfg_if! {
-            if #[cfg(paging)] {
-                let regions = crate::mm::memory_bank::create_memory_region_from_memory_bank(
-                    crate::boards::MEMORY_BANKS,
-                );
-                crate::boot::init_frames(&regions);
-                crate::mm::kernel_space::init_kernel_space(&regions)
-                    .expect("failed to initialize kernel address space");
-                crate::allocator::init_paged_heap()
-                    .expect("failed to initialize page heap");
-            } else {
-                crate::boot::init_heap()
-            }
+        #[cfg(paging)]
+        {
+            let regions = crate::mm::memory_bank::create_memory_region_from_memory_bank(
+                crate::boards::MEMORY_BANKS,
+            );
+            crate::boot::init_frames(&regions);
+            crate::mm::kernel_space::init_kernel_space(&regions)
+                .expect("failed to initialize kernel address space");
+            crate::allocator::init_paged_heap()
+                .expect("failed to initialize page heap");
         }
+        #[cfg(not(paging))]
+        crate::boot::init_heap();
     });
     STAGING.run(2, false, || {
         #[cfg(paging)]

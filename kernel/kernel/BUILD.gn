@@ -69,6 +69,7 @@ _shared_deps = [
   "//kernel/infra:blueos_infra",
   "//kernel/kconfig:blueos_kconfig",
   "//kernel/kconfig:generate_rustflags_file",
+  "//kernel/loader:blueos_loader",
   "//libs/libc",
 ]
 
@@ -94,6 +95,25 @@ _loader_backend_enabled = board_toolchain_info.current_cpu == "riscv32" ||
 if (_loader_backend_enabled) {
   _kernel_default_cfgs += [ "loader_backend" ]
   _shared_deps += [ "//kernel/loader:blueos_loader" ]
+}
+
+# Embed the first user ELF (`exec_app`) directly into the kernel image via
+# `include_bytes!` so `boot::init_user_app` can validate the spawn chain without
+# the FAT/virtio/VFS pipeline. Only the aarch64 virt board does this: it is the
+# only board with paging + a user-mode entry path wired end to end. The path is
+# resolved to the linked binary (`root_out_dir/bin/boot_exec_app`, the same
+# convention `postlink_action`/`gen_fat_image` use) and surfaced to rustc two
+# ways: as an `inputs` entry (so a changed ELF recompiles `blueos`) and as the
+# `EXEC_APP_ELF_PATH` rustenv var (read by `env!` in `boot.rs` to feed
+# `include_bytes!`). `boot_exec_app` is the non-testonly twin of
+# `loader_test_app`; `blueos` is not testonly, so it cannot depend on the
+# testonly original. Defined before both `kernel_unittest` and `blueos` so each
+# can graft the ELF path into its rustenv under the same gate.
+_exec_app_embed_enabled = board == "qemu_virt64_aarch64"
+if (_exec_app_embed_enabled) {
+  _exec_app_label = "//kernel/loader/tests/inputs/exec_app:boot_exec_app"
+  _exec_app_path =
+      get_label_info(_exec_app_label, "root_out_dir") + "/bin/boot_exec_app"
 }
 
 build_rust("kernel_unittest") {
@@ -183,8 +203,15 @@ build_rust("blueos") {
     "//kernel/macro:blueos_macro",
   ]
   rustenv = [ "TARGET_BOARD=${board}" ]
+  if (_exec_app_embed_enabled) {
+    rustenv += [ "EXEC_APP_ELF_PATH=" + rebase_path(_exec_app_path) ]
+  }
   cfgs = _kernel_default_cfgs
   deps = _shared_deps
+  if (_exec_app_embed_enabled) {
+    deps += [ _exec_app_label ]
+    inputs = [ _exec_app_path ]
+  }
   public_deps = board_deps
   public_deps += [ "//kernel/kconfig:generate_rustflags_file" ]
   public_configs += [
@@ -204,6 +231,38 @@ cbindgen("rust_wrapper") {
            "-c",
          ] + rebase_path([ "cbindgen.toml" ], root_build_dir) +
          rebase_path([ "." ], root_build_dir)
+}
+
+# Pre-populated FAT image carrying the first user ELF as `/fat/exec_app.elf` on
+# the QEMU block device. Only the aarch64 virt board has the paging + VFS +
+# fatfs + virtio-blk pipeline that makes a populated FAT meaningful; other
+# boards skip this and the runner falls back to the legacy empty-block path.
+#
+# Under the current `include_bytes!` interim (see `boot::init_user_app` and the
+# `EXEC_APP_ELF` static), the booted kernel embeds the ELF bytes directly and
+# does NOT read `/fat/exec_app.elf`; this image is staged for the eventual
+# VFS-read end state, at which point `init_user_app` switches from the embedded
+# static to `open_path("/fat/exec_app.elf")`.
+#
+# `exe` points at the non-testonly `boot_exec_app` twin rather than the
+# testonly `loader_test_app`: `gen_fat_image` does not forward `testonly` from
+# its invoker, so `user_app_fat` is non-testonly and GN forbids it from
+# depending on a testonly producer. `boot_exec_app` is byte-identical to
+# `loader_test_app` (same main.rs/linker/rustflags), so the shipped image is
+# unchanged. `exe_dst` decouples the runtime name (`/fat/exec_app.elf`) from
+# the build target name.
+if (board == "qemu_virt64_aarch64") {
+  gen_fat_image("user_app_fat") {
+    exe = "//kernel/loader/tests/inputs/exec_app:boot_exec_app"
+    exe_dst = "exec_app.elf"
+    # FAT16 needs >= 4085 data clusters (rust-fatfs derives FatType from the
+    # cluster count, ignoring the BPB FilSysType string). At 4096-byte clusters
+    # a 4MiB image has only 1023 clusters -> read as FAT12 -> the 16-bit FAT
+    # entries we write are misdecoded as 12-bit packed entries -> alloc_cluster
+    # fails on mkdir -> test_vfs panics. 32MiB yields ~8183 clusters, solidly
+    # FAT16. gen_fat_image.py enforces the >= 4085 floor defensively.
+    size = "32MiB"
+  }
 }
 
 if (defined(qemu_use_esp32_loader) && qemu_use_esp32_loader) {
@@ -231,6 +290,10 @@ if (defined(qemu_use_esp32_loader) && qemu_use_esp32_loader) {
     net_args = qemu_net_args
     block_img = "integration_test_block.img"
     block_args = qemu_block_args
+    if (board == "qemu_virt64_aarch64") {
+      # Ship the populated FAT (with /fat/exec_app.elf) instead of an empty disk.
+      prebuilt_block_img = ":user_app_fat"
+    }
   }
 }
 
@@ -274,6 +337,10 @@ if (defined(use_defmt) && use_defmt) {
     block_img = "unittest_block.img"
     block_args = qemu_block_args
     semihosting = true
+    if (board == "qemu_virt64_aarch64") {
+      # Ship the populated FAT (with /fat/exec_app.elf) instead of an empty disk.
+      prebuilt_block_img = ":user_app_fat"
+    }
   }
 }
 

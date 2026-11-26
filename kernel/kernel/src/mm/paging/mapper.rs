@@ -197,6 +197,17 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
         Self::entry_ptr(table, va, P::LEVELS - 1).ok()
     }
 
+    /// Decode the backing PFN of a leaf slot: a live descriptor decodes via
+    /// [`PageFormat::table_address`]; a retired leaf (valid bit clear, kept by
+    /// the NONE reprotect or `release_owned_range` as a no-allocation ledger)
+    /// stores the bare, page-aligned PFN itself. Frame 0 is never allocated, so
+    /// a zero entry still reads as "no mapping".
+    fn recover_pfn(entry: usize) -> Option<usize> {
+        P::table_address(entry).or_else(|| {
+            (entry != 0 && entry & (P::PAGE_SIZE - 1) == 0).then_some(entry)
+        })
+    }
+
     /// Back an exclusively reserved VA range with individually owned frames.
     /// Mapping attributes, backing initialization and translation synchronization
     /// are supplied by the caller. Failure restores an unmapped range.
@@ -239,7 +250,7 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
             }
         }
         let result = (|| {
-            self.prepare_range(virt, len)?;
+            unsafe { self.prepare_range(virt, len) }?;
             for va in (start..end).step_by(P::PAGE_SIZE) {
                 let frame = self
                     .allocator
@@ -247,21 +258,23 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
                     .ok_or("out of backing frames")?;
                 if init == FrameInit::Zeroed {
                     let ptr = kernel_phys_to_virt(frame).into_raw() as *mut u8;
-                    ptr.write_bytes(0, P::PAGE_SIZE);
+                    unsafe { ptr.write_bytes(0, P::PAGE_SIZE); }
                 }
                 if let Err(e) =
-                    self.map_range(VirtualAddress::new(va), frame, P::PAGE_SIZE, attributes)
+                    unsafe { self.map_range(VirtualAddress::new(va), frame, P::PAGE_SIZE, attributes) }
                 {
-                    self.allocator
-                        .free_frame(frame)
-                        .expect("return unpublished frame");
+                    unsafe {
+                        self.allocator
+                            .free_frame(frame)
+                            .expect("return unpublished frame");
+                    }
                     return Err(e);
                 }
             }
             Ok(())
         })();
         if result.is_err() {
-            self.release_owned_range(virt, len, &mut synchronize);
+            unsafe { self.release_owned_range(virt, len, &mut synchronize); }
         } else {
             synchronize();
         }
@@ -289,22 +302,24 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
         let end = start.checked_add(len).expect("owned range overflow");
         for va in (start..end).step_by(P::PAGE_SIZE) {
             if let Some(slot) = self.existing_slot(va) {
-                let entry = slot.read();
+                let entry = unsafe { slot.read() };
                 if P::is_valid(entry) {
-                    slot.write(entry & !1);
+                    unsafe { slot.write(entry & !1); }
                 }
             }
         }
         synchronize();
         for va in (start..end).step_by(P::PAGE_SIZE) {
             if let Some(slot) = self.existing_slot(va) {
-                let entry = slot.read();
+                let entry = unsafe { slot.read() };
                 if entry & 0b11 == 0b10 {
                     let frame = P::table_address(entry | 1).expect("retired page descriptor");
-                    slot.write(0);
-                    self.allocator
-                        .free_frame(PhysicalAddress::new(frame))
-                        .expect("release owned backing");
+                    unsafe {
+                        slot.write(0);
+                        self.allocator
+                            .free_frame(PhysicalAddress::new(frame))
+                            .expect("release owned backing");
+                    }
                 }
             }
         }
@@ -315,19 +330,23 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
         let span = P::PAGE_SIZE * (P::PAGE_SIZE / size_of::<usize>());
         let mut va = start;
         while va < end {
-            self.prune_empty_path(va, &mut retired);
+            unsafe { self.prune_empty_path(va, &mut retired); }
             va += (span - (va & (span - 1))).min(end - va);
         }
         if retired != 0 {
             synchronize();
             while retired != 0 {
                 let frame = retired;
-                retired = (kernel_phys_to_virt(PhysicalAddress::new(frame)).into_raw()
-                    as *const usize)
-                    .read();
-                self.allocator
-                    .free_frame(PhysicalAddress::new(frame))
-                    .expect("release empty owned table");
+                retired = unsafe {
+                    (kernel_phys_to_virt(PhysicalAddress::new(frame)).into_raw()
+                        as *const usize)
+                        .read()
+                };
+                unsafe {
+                    self.allocator
+                        .free_frame(PhysicalAddress::new(frame))
+                        .expect("release empty owned table");
+                }
             }
         }
     }
@@ -340,7 +359,7 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
         let mut depth = 0;
         for level in 0..P::LEVELS - 1 {
             let slot = Self::entry_ptr(tables[level as usize], va, level).unwrap();
-            let Some(child) = P::table_address(slot.read()) else {
+            let Some(child) = P::table_address(unsafe { slot.read() }) else {
                 break;
             };
             slots[level as usize] = slot;
@@ -348,18 +367,111 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
             depth = level as usize + 1;
         }
         for level in (1..=depth).rev() {
-            let ptr =
-                kernel_phys_to_virt(PhysicalAddress::new(tables[level])).into_raw() as *mut usize;
-            if core::slice::from_raw_parts(ptr, P::PAGE_SIZE / size_of::<usize>())
-                .iter()
-                .any(|e| *e != 0)
-            {
+            let ptr = kernel_phys_to_virt(PhysicalAddress::new(tables[level])).into_raw()
+                as *mut usize;
+            let nonempty = unsafe {
+                core::slice::from_raw_parts(ptr, P::PAGE_SIZE / size_of::<usize>())
+                    .iter()
+                    .any(|e| *e != 0)
+            };
+            if nonempty {
                 break;
             }
-            slots[level - 1].write(0);
-            ptr.write(*retired);
+            unsafe {
+                slots[level - 1].write(0);
+                ptr.write(*retired);
+            }
             *retired = tables[level];
         }
+    }
+
+    /// Rewrite the access attributes of an already-backed leaf range, without
+    /// allocating or freeing any frame or changing table structure.
+    ///
+    /// The range is byte granular; permissions apply at page granularity to
+    /// every page `[virt, virt+len)` overlaps, matching how a real MMU can only
+    /// narrow access per page. Each overlapping leaf keeps its backing PFN; only
+    /// its descriptor bits change. A `NONE` attribute (no
+    /// READ/WRITE/EXECUTE) clears the valid bit but retains the PFN, mirroring
+    /// how [`Self::release_owned_range`] retires a leaf, so a later non-NONE
+    /// reprotect restores access in place. Leaves with no backing slot at all
+    /// (never mapped or already pruned) cause an error before any descriptor is
+    /// written.
+    ///
+    /// # Safety
+    /// The caller exclusively owns the range, serializes all walks/updates, and
+    /// guarantees every overlapping page is backed by a live or retired leaf of
+    /// this format.
+    /// `synchronize` has the same requirements as in [`Self::map_owned_range`]:
+    /// it must publish table writes and complete invalidation of all relevant
+    /// translations and walk caches before returning, and must not unwind.
+    pub(crate) unsafe fn reprotect_range(
+        &mut self,
+        virt: VirtualAddress,
+        len: usize,
+        attributes: MemAttribute,
+        mut synchronize: impl FnMut(),
+    ) -> Result<(), &'static str> {
+        // NONE (no READ/WRITE/EXECUTE) is the legitimate revoke-access case
+        // requested by the loader's whole-range `set_permissions(.., NONE)` step
+        // before it narrows per-segment access. The full `validate_attributes`
+        // requires READ, which would reject NONE; only enforce the exclusions
+        // that matter here — W|X is rejected, device memory is never executable.
+        // Those are vacuous for NONE (no X bit set), so NONE always passes.
+        let has_access = attributes
+            .flags
+            .intersects(MemFlags::READ | MemFlags::WRITE | MemFlags::EXECUTE);
+        if has_access {
+            Self::validate_attributes(attributes)?;
+        } else if matches!(attributes.memory_type, MemType::Device)
+            && attributes.flags.contains(MemFlags::EXECUTE)
+        {
+            return Err("device memory cannot be executable");
+        }
+        let start = virt.into_raw();
+        let end = start.checked_add(len).ok_or("reprotect range overflow")?;
+        if len == 0 {
+            return Ok(());
+        }
+        if !Self::valid_va(start)
+            || !Self::valid_va(end - 1)
+            || (start >> P::VIRT_ADDR_BITS) != ((end - 1) >> P::VIRT_ADDR_BITS)
+        {
+            return Err("reprotect range exceeds address space");
+        }
+        // Walk the covered pages, not the raw range: an unaligned start would
+        // otherwise step over a page crossing (e.g. [0x...044, 0x...0a8) must
+        // touch both pages it overlaps).
+        let first = start & !(P::PAGE_SIZE - 1);
+        let last = (end - 1) & !(P::PAGE_SIZE - 1);
+        // Recover the backing PFNs before mutating, so a missing slot fails the
+        // whole operation without partial rewrites. A valid leaf carries its
+        // PFN directly; a retired leaf (valid bit clear, bare PFN retained by
+        // the NONE reprotect or release_owned_range) is the page-aligned PFN
+        // itself and decodes without any descriptor bits.
+        for va in (first..=last).step_by(P::PAGE_SIZE) {
+            let slot = self.existing_slot(va).ok_or("no mapping to reprotect")?;
+            let entry = unsafe { slot.read() };
+            Self::recover_pfn(entry).ok_or("reprotect target is not a leaf mapping")?;
+        }
+        // A NONE attribute (no READ/WRITE/EXECUTE) writes the bare PFN: the
+        // valid bit stays clear but the PFN is retained, so a later
+        // non-NONE reprotect restores access in place without allocation.
+        // Anything else builds the full descriptor via get_translate.
+        for va in (first..=last).step_by(P::PAGE_SIZE) {
+            let slot = self.existing_slot(va).ok_or("no mapping to reprotect")?;
+            let entry = unsafe { slot.read() };
+            let pfn = Self::recover_pfn(entry)
+                .ok_or("reprotect target is not a leaf mapping")?;
+            let new_desc = if has_access {
+                P::get_translate(pfn, attributes, false)
+            } else {
+                pfn
+            };
+            unsafe { slot.write(new_desc); }
+        }
+        synchronize();
+        Ok(())
     }
 
     fn validate_attributes(attributes: MemAttribute) -> Result<(), &'static str> {

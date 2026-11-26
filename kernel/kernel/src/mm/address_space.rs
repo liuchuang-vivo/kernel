@@ -223,6 +223,74 @@ impl AddressSpace {
             .write_user_stack(destination, bytes)
     }
 
+    /// Find the lowest `align`-aligned, `len`-sized free hole in
+    /// `[mmap_min, user_end)`. Returns the hole start, or `None` if none fits.
+    /// The range is not reserved by this call; the caller must reserve it.
+    #[cfg(paging)]
+    pub fn find_free_range(&self, len: usize, align: usize) -> Option<usize> {
+        self.state
+            .irqsave_lock()
+            .find_free_range(self.mmap_min, self.user_end(), len, align)
+    }
+
+    /// Back an exclusively reserved `[start, start+len)` image range with
+    /// zeroed, user read/write frames and register its VMA. The table stays
+    /// inactive. On failure no VMA or mapping is left behind.
+    ///
+    /// `flags` must include READ and WRITE; the loader grants those for the
+    /// initial copy/BSS phase and narrows them later via [`Self::protect_image`].
+    #[cfg(paging)]
+    pub fn load_image_range(
+        &self,
+        start: usize,
+        len: usize,
+        flags: MemFlags,
+    ) -> Result<(), error::Error> {
+        self.validate_range(start, start.checked_add(len).ok_or(error::code::EINVAL)?)?;
+        self.state.irqsave_lock().load_image_range(start, len, flags)
+    }
+
+    /// Release a loaded image range: retire its mappings and drop its VMA.
+    #[cfg(paging)]
+    pub fn release_image(&self, start: usize, len: usize) {
+        self.state.irqsave_lock().release_image(start, len)
+    }
+
+    /// Rewrite the access attributes of a loaded image range in place.
+    /// `flags` with no READ/WRITE/EXECUTE revokes access (NONE) while retaining
+    /// backing; otherwise the range becomes accessible with `flags`.
+    #[cfg(paging)]
+    pub fn protect_image(
+        &self,
+        start: usize,
+        len: usize,
+        flags: MemFlags,
+    ) -> Result<(), error::Error> {
+        self.state.irqsave_lock().protect_image(start, len, flags)
+    }
+
+    /// Copy kernel bytes into a loaded image range. The destination must lie
+    /// inside a VMA mapped with READ|WRITE|USER. The table stays inactive; this
+    /// is a preparation interface, not runtime `copy_to_user`.
+    #[cfg(paging)]
+    pub fn write_image(&self, destination: usize, bytes: &[u8]) -> Result<(), error::Error> {
+        self.state.irqsave_lock().write_image(destination, bytes)
+    }
+
+    /// Read bytes from a loaded image range into a kernel buffer. The source
+    /// must lie inside a VMA mapped with READ|USER and have a valid leaf on
+    /// every page (the live permission gate). The table stays inactive.
+    #[cfg(paging)]
+    pub fn read_image(&self, source: usize, bytes: &mut [u8]) -> Result<(), error::Error> {
+        self.state.irqsave_lock().read_image(source, bytes)
+    }
+
+    /// Zero `len` bytes of a loaded image range starting at `destination`.
+    #[cfg(paging)]
+    pub fn zero_image(&self, destination: usize, len: usize) -> Result<(), error::Error> {
+        self.state.irqsave_lock().zero_image(destination, len)
+    }
+
     /// Build a native-word ELF-style startup stack in the inactive address space.
     ///
     /// Writes `argc`, null-terminated `argv`/`envp` pointer arrays, and `auxv`
@@ -335,10 +403,10 @@ impl AddressSpace {
         let vmas = &mut state.vmas;
         // Reject overlap with the immediately-following VMA: its start must be
         // >= new_end. The next node's start is the BTreeMap key (free).
-        if let Some((next_start, _)) = vmas.range((Excluded(start), Unbounded)).next() {
-            if *next_start < new_end {
-                return Err(error::code::EINVAL);
-            }
+        if let Some((next_start, _)) = vmas.range((Excluded(start), Unbounded)).next()
+            && *next_start < new_end
+        {
+            return Err(error::code::EINVAL);
         }
         vmas.get_mut(&start).unwrap().set_end(new_end)?;
         Ok(())
@@ -443,10 +511,10 @@ impl AddressSpace {
     /// `true` if a `[start, end)` range would overlap any existing VMA.
     /// Caller holds the tree lock. `start` is the BTreeMap key
     fn overlaps(vmas: &BTreeMap<usize, Vma>, start: usize, end: usize) -> bool {
-        if let Some((_, prev)) = vmas.range(..=start).next_back() {
-            if prev.end() > start {
-                return true;
-            }
+        if let Some((_, prev)) = vmas.range(..=start).next_back()
+            && prev.end() > start
+        {
+            return true;
         }
         if vmas.range(start..end).next().is_some() {
             return true;

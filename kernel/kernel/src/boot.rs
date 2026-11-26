@@ -142,6 +142,19 @@ extern "C" fn init() {
 
     init_apps();
 
+    // Spawn the first user-mode process once the scheduler side is ready: ELF
+    // loading, user stack and EL0 entry. Only the aarch64 virt board has the
+    // paging + user-entry path wired end to end; the ELF bytes are embedded
+    // directly into the kernel image.
+    //
+    // `not(test)` keeps this out of `--test` harness builds. The standalone
+    // `loader_integration_test` binary has its own `main` and never enters
+    // `boot::init`, so no `loader_test_exec` exclusion is needed here — and
+    // that cfg is not set on the `blueos` rlib anyway (cfgs are per-crate), so
+    // such a gate would be a no-op.
+    #[cfg(all(paging, target_board = "qemu_virt64_aarch64", not(test)))]
+    init_user_app();
+
     arch::start_schedule(scheduler::schedule);
     unreachable!("We should have jumped to the schedule loop!");
 }
@@ -192,6 +205,144 @@ pub(crate) fn run_init_array() {
         }
         INIT_ARRAY_DONE = true;
     }
+}
+
+/// The first user ELF image, embedded into the kernel image at compile time.
+///
+/// The build resolves `EXEC_APP_ELF_PATH` (set in `blueos`'s `rustenv` only for
+/// `qemu_virt64_aarch64`) to the absolute path of the linked `boot_exec_app`
+/// binary and feeds it to `include_bytes!`, so the ELF bytes live in the
+/// kernel's `.rodata`. This bypasses the FAT/virtio/VFS pipeline to validate
+/// the spawn chain with the fewest moving parts; the eventual end state is to
+/// read the image from `/fat/exec_app.elf` via the VFS, at which point this
+/// static and its `rustenv`/`inputs` wiring are removed.
+#[cfg(all(paging, target_board = "qemu_virt64_aarch64", not(test)))]
+static EXEC_APP_ELF: &[u8] = include_bytes!(env!("EXEC_APP_ELF_PATH"));
+
+/// Spawn the first user-mode process end to end.
+///
+/// Builds a child process under the root, prepares its user stack, feeds the
+/// embedded ELF bytes to the loader pipeline to map the image into the user
+/// address space. Per path 3, the user table is activated for the duration of
+/// the pipeline so `write_image`, `zero_image`, and `CodeCache::synchronize`
+/// translate user VAs through hardware `TTBR0`, then deactivated before the
+/// thread is forged — the first context switch re-activates it and `eret`s to
+/// EL0 at the entry.
+///
+/// Every failure is logged and skipped (no panic): a missing image or a stack
+/// shortage must not abort the kernel bring-up that already started the
+/// scheduler-bound kernel threads in [`init_apps`].
+#[cfg(all(paging, target_board = "qemu_virt64_aarch64", not(test)))]
+#[inline(never)]
+fn init_user_app() {
+    use crate::{
+        arch::Aarch64CodeCache, loader::adapters::SliceElfReader, mm::AddressSpaceImageAllocator,
+    };
+    use alloc::sync::Arc;
+    use blueos_loader::{memory::TargetAddress, profile, LoadRequest, LoadedImage};
+
+    let root = crate::process::ProcessManager::get().root_process();
+    let proc = match crate::process::ProcessManager::get().create_process(Arc::downgrade(root)) {
+        Ok(proc) => proc,
+        Err(err) => {
+            log::warn!("init_user_app: create_process failed: {}", err);
+            return;
+        }
+    };
+    let aspace = proc.address_space().clone();
+
+    // Prepare the initial user stack: backing pages, then the argc/argv/envp/auxv
+    // startup frame. The returned SP is the 16-byte-aligned first EL0 SP.
+    let stack_size = blueos_kconfig::CONFIG_MAIN_THREAD_STACK_SIZE as usize;
+    if let Err(err) = aspace.init_user_stack(stack_size) {
+        log::warn!("init_user_app: init_user_stack failed: {}", err);
+        return;
+    }
+    let start = match aspace.build_user_stack(&[b"exec_app"], &[], &[]) {
+        Ok(start) => start,
+        Err(err) => {
+            log::warn!("init_user_app: build_user_stack failed: {}", err);
+            return;
+        }
+    };
+    let sp = start.sp();
+
+    // Feed the embedded ELF bytes to the loader pipeline. The slice reader
+    // issues positional reads over the in-image `.rodata` bytes — no VFS, no
+    // virtio, no full-image heap buffer; the bytes flow reader → loader's
+    // 512-byte scratch → user pages.
+    let reader = SliceElfReader::new(EXEC_APP_ELF);
+
+    // Path 3: activate the user table for the duration of the loader pipeline
+    // so write_image/zero_image and CodeCache::synchronize translate user VAs
+    // through hardware TTBR0 rather than software walks. boot runs before
+    // start_schedule, so this activation is a non-concurrent transient — no
+    // scheduler, no other cores, no threads can touch TTBR0 in parallel.
+    arch::switch_user_address_space(None, Some(aspace.root_address()));
+
+    let loaded: LoadedImage<_> = match blueos_loader::load_elf(
+        reader,
+        LoadRequest::new(
+            profile::LoadProfile::aarch64(),
+            profile::LoadLimits::DEFAULT,
+        ),
+        AddressSpaceImageAllocator::new(aspace.clone()),
+        &mut Aarch64CodeCache::new(),
+    ) {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            // Deactivate before returning so a failed load does not leak an
+            // active user table into the rest of bring-up.
+            arch::switch_user_address_space(Some(aspace.root_address()), None);
+            log::warn!("init_user_app: loader pipeline failed: {:?}", err);
+            return;
+        }
+    };
+
+    // Load done: drop back to kernel-only TTBR0 (TTBR1 is unchanged). Entry
+    // extraction, kernel-stack allocation, and spawn are all kernel-side and
+    // never touch user VAs. The scheduler re-activates this table on the first
+    // context switch into the user thread.
+    arch::switch_user_address_space(Some(aspace.root_address()), None);
+
+    let entry: TargetAddress = match loaded.entry() {
+        Some(entry) => entry,
+        None => {
+            log::warn!("init_user_app: ELF has no entry point");
+            return;
+        }
+    };
+    // exec_app is ET_EXEC, so the header entry is the PC directly.
+    let pc = entry.get() as usize;
+
+    // Kernel-side stack for the user thread's saved context.
+    let kstack = match thread::Stack::from_size(stack_size) {
+        Some(stack) => stack,
+        None => {
+            log::warn!("init_user_app: kernel stack allocation failed");
+            return;
+        }
+    };
+    // `.start()` enqueues the thread ready (GlobalQueueVisitor::add +
+    // queue_ready_thread); the first schedule picks it up.
+    let node = thread::Builder::user(pc, sp).set_stack(kstack).start();
+    if !proc.add_thread(node) {
+        log::warn!("init_user_app: user thread already linked to a process");
+    }
+
+    // Leak the loaded image: it owns the `AddressSpaceImageMapping` that backs
+    // the user pages the thread now executes. `LoadedImage` has no
+    // take-ownership accessor (the old `into_mapping()` was removed), so forget
+    // the whole image — its `Drop` is skipped, which in turn skips the
+    // mapping's `Drop` (the `release_image` in `AddressSpaceImageMapping::drop`),
+    // keeping the backing alive for the life of the booted image. A clean
+    // teardown path is D-trap-fault/exit work.
+    core::mem::forget(loaded);
+    log::info!(
+        "init_user_app: spawned user process at pc={:#x} sp={:#x}",
+        pc,
+        sp
+    );
 }
 
 #[inline(never)]

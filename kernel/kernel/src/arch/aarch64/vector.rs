@@ -23,15 +23,15 @@ core::arch::global_asm!(
 .align 11 
 .global vector_table
 vector_table:
-    // Current EL with SP0
+    // Current EL with SP0 — this kernel runs EL1 on SP_EL1 (SPx) only.
     .align 7
-        b el0_not_supported       // Synchronous
+        b current_el_sp0_not_supported   // Synchronous
     .align 7
-        b el0_not_supported       // IRQ
+        b current_el_sp0_not_supported   // IRQ
     .align 7
-        b el0_not_supported       // FIQ 
+        b current_el_sp0_not_supported   // FIQ
     .align 7
-        b el0_not_supported       // SError
+        b current_el_sp0_not_supported   // SError
 
     // Current EL with SPx
     .align 7
@@ -43,25 +43,25 @@ vector_table:
     .align 7
         b el1_error               // SError
 
-    // Lower EL using AArch64
+    // Lower EL using AArch64 — user (EL0) traps land here.
     .align 7
-        b lowerel_not_supported   // Synchronous
+        b el0_sync                // Synchronous
     .align 7
-        b lowerel_not_supported   // IRQ
+        b el0_irq                 // IRQ
     .align 7
-        b lowerel_not_supported   // FIQ
+        b el0_fiq                 // FIQ
     .align 7
-        b lowerel_not_supported   // SError
+        b el0_error               // SError
 
-    // Lower EL using AArch32
+    // Lower EL using AArch32 — only AArch64 EL0 is supported.
     .align 7
-        b lowerel_not_supported    // Synchronous
+        b lowerel_aarch32_not_supported    // Synchronous
     .align 7
-        b lowerel_not_supported    // IRQ
+        b lowerel_aarch32_not_supported    // IRQ
     .align 7
-        b lowerel_not_supported    // FIQ
+        b lowerel_aarch32_not_supported    // FIQ
     .align 7
-        b lowerel_not_supported    // SError
+        b lowerel_aarch32_not_supported    // SError
 "
 );
 

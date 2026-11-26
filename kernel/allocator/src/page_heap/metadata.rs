@@ -73,10 +73,10 @@ impl Area {
         })
     }
     pub(crate) unsafe fn kind(&self) -> Kind {
-        *self.kind.get()
+        unsafe { *self.kind.get() }
     }
     pub(crate) unsafe fn set_kind(&self, kind: Kind) {
-        *self.kind.get() = kind;
+        unsafe { *self.kind.get() = kind; }
     }
     /// Whether the object heap has detached this descriptor.
     ///
@@ -86,12 +86,12 @@ impl Area {
         unsafe { !self.links[0].is_linked() }
     }
     pub(crate) unsafe fn attach(&self, start: NonNull<u8>) {
-        *self.payload.get() = Some(start);
+        unsafe { *self.payload.get() = Some(start); }
     }
     pub(crate) unsafe fn span(node: NonNull<Self>) -> PageSpan {
-        let area = node.as_ref();
+        let area = unsafe { node.as_ref() };
         PageSpan {
-            start: (*area.payload.get()).expect("attached payload provenance"),
+            start: unsafe { (*area.payload.get()).expect("attached payload provenance") },
             pages: (area.end - area.start) / PAGE_SIZE,
             area: Some(node),
         }
@@ -126,13 +126,15 @@ impl<const I: usize> AreaIndex<I> {
     /// Caller keeps nodes and ranges stable until removal, serializes this
     /// index, and retains backing for every shared reference to a linked node.
     pub unsafe fn insert(&mut self, node: NonNull<Area>) -> Result<(), HeapError> {
-        let area = node.as_ref();
+        let area = unsafe { node.as_ref() };
         if self.overlaps(area.start, area.end) {
             return Err(HeapError::Conflict);
         }
-        self.tree
-            .insert(node, |a, b| a.start.cmp(&b.start))
-            .map_err(|_| HeapError::Conflict)
+        unsafe {
+            self.tree
+                .insert(node, |a, b| a.start.cmp(&b.start))
+                .map_err(|_| HeapError::Conflict)
+        }
     }
 
     pub fn find(&self, address: usize) -> Option<NonNull<Area>> {

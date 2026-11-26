@@ -88,7 +88,7 @@ impl FirstFitFrameAllocator {
     /// Every free page must be writable through the kernel direct map. The RAM
     /// must remain valid for the lifetime of all returned frames.
     pub unsafe fn init(&self, regions: &[MemoryRegion]) -> Option<()> {
-        let states = &mut *addr_of_mut!(STATES);
+        let states = unsafe { &mut *addr_of_mut!(STATES) };
         let page_size = PAGE_SIZE;
         let base = PHYS_BASE;
 

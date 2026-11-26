@@ -36,7 +36,11 @@ SECTIONS
     *(.rodata .rodata.*)
   } > @REGION@ :text
 
-  .data : ALIGN(4)
+  /* The RX text PT_LOAD and the RW data PT_LOAD must not share a 4K page:
+     permissions apply per page, and a page covered by both segments cannot be
+     writable and executable at once (the kernel rejects W|X), so an unaligned
+     .data would let the RW segment's narrowing clobber X on the entry page. */
+  .data : ALIGN(4096)
   {
     *(.sdata .sdata.*)
     *(.data .data.*)

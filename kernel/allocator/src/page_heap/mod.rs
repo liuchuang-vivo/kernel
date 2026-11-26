@@ -115,12 +115,15 @@ impl PageSpan {
     /// It must not already belong to an object heap. The source removes its own
     /// reservation only after the heap has detached the descriptor.
     pub unsafe fn with_area(mut self, area: NonNull<Area>) -> Result<Self, HeapError> {
-        if area.as_ref().start != self.start.as_ptr().addr()
-            || area.as_ref().end != self.start.as_ptr().addr() + self.byte_len()
+        let area_ref = unsafe { area.as_ref() };
+        if area_ref.start != self.start.as_ptr().addr()
+            || area_ref.end != self.start.as_ptr().addr() + self.byte_len()
         {
             return Err(HeapError::InvalidGeometry);
         }
-        area.as_ref().attach(self.start);
+        unsafe {
+            area_ref.attach(self.start);
+        }
         self.area = Some(area);
         Ok(self)
     }
@@ -358,8 +361,10 @@ impl PageHeap {
             .checked_add(span.byte_len())
             .ok_or(HeapError::InvalidRequest)?;
         stats.peak_charged_bytes = stats.peak_charged_bytes.max(stats.charged_bytes);
-        self.areas.insert(area)?;
-        area.as_ref().set_kind(Kind::Large(layout));
+        unsafe {
+            self.areas.insert(area)?;
+            area.as_ref().set_kind(Kind::Large(layout));
+        }
         self.stats = stats;
         Ok(Allocation {
             ptr: span.start,
@@ -419,7 +424,9 @@ impl PageHeap {
             }
         } else {
             let node = info.span.area.ok_or(HeapError::CorruptMetadata)?;
-            node.as_ref().set_kind(Kind::Large(new));
+            unsafe {
+                node.as_ref().set_kind(Kind::Large(new));
+            }
         }
         Ok(true)
     }
@@ -438,7 +445,7 @@ impl PageHeap {
         let info = self.allocation_info(ptr)?;
         validate_original_layout(info, layout)?;
         if let AllocationKind::Slab(_) = info.kind {
-            return self.free_slab(ptr, info);
+            return unsafe { self.free_slab(ptr, info) };
         }
         let mut stats = self.stats;
         stats.large_pages = stats
@@ -461,7 +468,9 @@ impl PageHeap {
             .areas
             .remove(info.span.start.as_ptr().addr())
             .ok_or(HeapError::CorruptMetadata)?;
-        node.as_ref().set_kind(Kind::Empty);
+        unsafe {
+            node.as_ref().set_kind(Kind::Empty);
+        }
         self.stats = stats;
         Ok(ReleaseAction::Pages(info.span))
     }
