@@ -100,6 +100,7 @@ pub mod syscalls {
         ApplicationBeginExit,
         ApplicationFinishExit,
         ReallocMem,
+        Execve,
         LastNR,
     }
 }

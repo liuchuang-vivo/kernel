@@ -397,6 +397,20 @@ impl Process {
         &self.address_space
     }
 
+    pub fn replace_address_space(&self, new: Arc<AddressSpace>) -> Arc<AddressSpace> {
+        let _irq = crate::support::DisableInterruptGuard::new();
+        // SAFETY: `self` is pinned behind its owning `Arc<Process>` (storage is
+        // never moved or dropped — see the `Send/Sync` impl). The `&self`
+        // reference's address is therefore the address of the `Process` inside
+        // the `Arc` allocation, so casting it to `*mut Process` yields a valid
+        // pinned place. Under the irqsave guard with no sibling threads
+        // (caller's contract), no other access to `self.address_space` is live,
+        // so this `&mut` aliases nothing — the same in-place mutation pattern
+        // used by `Process::new`/`fork` during construction.
+        let this = unsafe { (self as *const Process).cast_mut().as_mut().unwrap() };
+        core::mem::replace(&mut this.address_space, new)
+    }
+
     /// Add a thread to this process's thread list.
     ///
     /// Returns `true` when success, and `false` when failed.
