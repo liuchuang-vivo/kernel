@@ -114,6 +114,15 @@ impl ProcessManager {
         Ok(inserted)
     }
 
+    /// Allocate a PID and register a forked child of `parent`.
+    pub fn fork_process(&self, parent: &Arc<Process>) -> Result<Arc<Process>, Error> {
+        let pid = self.alloc_pid();
+        let process = Process::fork(pid, parent)?;
+        let inserted = self.table.insert(process);
+        parent.add_child(inserted.pid(), Arc::downgrade(&inserted));
+        Ok(inserted)
+    }
+
     pub fn destroy_process(&self, pid: Pid) -> Option<Arc<Process>> {
         if pid == ROOT_PID {
             return None;
@@ -280,6 +289,28 @@ impl Process {
         Ok(arc)
     }
 
+    pub(crate) fn fork(pid: Pid, parent: &Arc<Process>) -> Result<Arc<Self>, crate::error::Error> {
+        let child_as = Arc::new(AddressSpace::new()?);
+        #[cfg(paging)]
+        AddressSpace::duplicate_from(&child_as, &parent.address_space)?;
+        let arc = Arc::new(Self {
+            pid,
+            topology: SpinLock::new(ProcessTopology {
+                parent: Arc::downgrade(parent),
+                children: BTreeMap::new(),
+                state: ProcessState::Alive,
+            }),
+            threads: SpinLock::new(ThreadList::new()),
+            address_space: child_as,
+            #[cfg(enable_vfs)]
+            fd_manager: SpinLock::new(parent.fd_manager.irqsave_lock().clone()),
+        });
+        // SAFETY: `arc` is the sole strong ref and is not yet observable.
+        let p = unsafe { Arc::as_ptr(&arc).cast_mut().as_mut().unwrap() };
+        p.threads.irqsave_lock().init();
+        Ok(arc)
+    }
+
     pub fn pid(&self) -> Pid {
         self.pid
     }
@@ -364,6 +395,20 @@ impl Process {
     /// This process's independent address space.
     pub fn address_space(&self) -> &Arc<AddressSpace> {
         &self.address_space
+    }
+
+    pub fn replace_address_space(&self, new: Arc<AddressSpace>) -> Arc<AddressSpace> {
+        let _irq = crate::support::DisableInterruptGuard::new();
+        // SAFETY: `self` is pinned behind its owning `Arc<Process>` (storage is
+        // never moved or dropped — see the `Send/Sync` impl). The `&self`
+        // reference's address is therefore the address of the `Process` inside
+        // the `Arc` allocation, so casting it to `*mut Process` yields a valid
+        // pinned place. Under the irqsave guard with no sibling threads
+        // (caller's contract), no other access to `self.address_space` is live,
+        // so this `&mut` aliases nothing — the same in-place mutation pattern
+        // used by `Process::new`/`fork` during construction.
+        let this = unsafe { (self as *const Process).cast_mut().as_mut().unwrap() };
+        core::mem::replace(&mut this.address_space, new)
     }
 
     /// Add a thread to this process's thread list.

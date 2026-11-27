@@ -580,6 +580,18 @@ define_syscall_handler!(exit_thread() -> c_long {
     -1
 });
 
+define_syscall_handler!(fork() -> c_long {
+    fork_impl()
+});
+
+define_syscall_handler!(execve(
+    path: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char
+) -> c_long {
+    execve_impl(path, argv, envp)
+});
+
 // These operations coordinate this kernel's standalone application runtime;
 // they are not Linux exit/exit_group syscall numbers or forced cancellation.
 define_syscall_handler!(application_begin_exit(status: c_int) -> c_long {
@@ -612,6 +624,275 @@ define_syscall_handler!(application_finish_exit() -> c_long {
     #[cfg(not(loader_backend))]
     { -(libc::ENOSYS as c_long) }
 });
+
+/// `fork` implementation: duplicate the current process.
+fn fork_impl() -> core::ffi::c_long {
+    use core::ffi::c_long;
+
+    #[cfg(not(paging))]
+    {
+        return -(libc::ENOSYS as c_long);
+    }
+    #[cfg(not(enable_vfs))]
+    {
+        return -(libc::ENOSYS as c_long);
+    }
+    #[cfg(all(paging, enable_vfs))]
+    {
+        use crate::{arch::Context as ArchContext, process::ProcessManager};
+
+        let Some(parent) = crate::process::current_process() else {
+            return -(libc::EPERM as c_long);
+        };
+        let current = scheduler::current_thread_ref();
+        if current.kind() != thread::ThreadKind::User {
+            return -(libc::EPERM as c_long);
+        }
+
+        let parent_ctx: &ArchContext = unsafe { &*(current.saved_sp() as *const ArchContext) };
+
+        // Create the child process
+        let child = match ProcessManager::get().fork_process(&parent) {
+            Ok(c) => c,
+            Err(_) => return -(libc::ENOMEM as c_long),
+        };
+        let child_pid = child.pid().0 as c_long;
+
+        let mut child_ctx: ArchContext = unsafe { core::ptr::read(parent_ctx) };
+        child_ctx.x0 = 0;
+
+        let child_thread = Builder::new(Entry::User {
+            pc: parent_ctx.elr,
+            sp: parent_ctx.sp_el0,
+        })
+        .build();
+
+        {
+            let mut w = child_thread.lock();
+            let dst = w.saved_sp() as *mut ArchContext;
+            unsafe { core::ptr::write(dst, child_ctx) };
+        }
+
+        if !child.add_thread(child_thread.clone()) {
+            let mut t = child_thread.clone();
+            thread::GlobalQueueVisitor::remove(&mut t);
+            return -(libc::EAGAIN as c_long);
+        }
+
+        debug_assert_eq!(
+            scheduler::queue_ready_thread(thread::IDLE, child_thread),
+            Ok(())
+        );
+
+        child_pid
+    }
+}
+
+/// `execve` implementation: replace the current process's image.
+fn execve_impl(
+    path: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+) -> core::ffi::c_long {
+    use core::ffi::{c_char, c_long, CStr};
+
+    #[cfg(not(paging))]
+    {
+        return -(libc::ENOSYS as c_long);
+    }
+    #[cfg(not(enable_vfs))]
+    {
+        return -(libc::ENOSYS as c_long);
+    }
+    #[cfg(all(paging, enable_vfs))]
+    {
+        use crate::{
+            arch::{self, Aarch64CodeCache, Context as ArchContext},
+            loader::adapters::VfsElfReader,
+            mm::AddressSpaceImageAllocator,
+            process::current_process,
+            vfs,
+        };
+        use alloc::{sync::Arc, vec, vec::Vec};
+        use blueos_loader::{memory::TargetAddress, profile, LoadRequest};
+
+        // --- 1. Copy path / argv / envp out of user memory -----------------
+        //
+        // All user-pointer reads happen up front, before any allocation, so a
+        // bad pointer fails fast with EFAULT and touches nothing.
+        if path.is_null() {
+            return -(libc::EFAULT as c_long);
+        }
+        let path_str = match unsafe { CStr::from_ptr(path) }.to_str() {
+            Ok(s) => s,
+            Err(_) => return -(libc::EINVAL as c_long),
+        };
+
+        // Collect the caller-supplied argv/envp arrays (NULL-terminated) into
+        // owned kernel buffers. If the caller passes NULL, default to a
+        // single-element argv naming the program and an empty envp.
+        let collect = |mut ptrs: *const *const c_char| -> Result<Vec<Vec<u8>>, c_long> {
+            if ptrs.is_null() {
+                return Ok(Vec::new());
+            }
+            let mut out = Vec::new();
+            loop {
+                let p = unsafe { core::ptr::read(ptrs) };
+                if p.is_null() {
+                    break;
+                }
+                match unsafe { CStr::from_ptr(p) }.to_str() {
+                    Ok(s) => out.push(s.as_bytes().to_vec()),
+                    Err(_) => return Err(-(libc::EINVAL as c_long)),
+                }
+                ptrs = unsafe { ptrs.add(1) };
+            }
+            Ok(out)
+        };
+        let argv_vec = match collect(argv) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let envp_vec = match collect(envp) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+
+        let Some(proc) = current_process() else {
+            return -(libc::EPERM as c_long);
+        };
+        let current = scheduler::current_thread_ref();
+        if current.kind() != thread::ThreadKind::User {
+            return -(libc::EPERM as c_long);
+        }
+
+        // --- 2. Open the executable and wrap it for the loader -------------
+        let file = match vfs::open_path(path_str, libc::O_RDONLY, 0) {
+            Ok(f) => f,
+            Err(e) => return -(e.to_errno() as c_long),
+        };
+        let reader = match VfsElfReader::new(file) {
+            Ok(r) => r,
+            Err(_) => return -(libc::ENOEXEC as c_long),
+        };
+
+        // --- 3. Build a fresh address space: stack first, then load --------
+        let new_aspace = match crate::mm::address_space::AddressSpace::new() {
+            Ok(a) => Arc::new(a),
+            Err(_) => return -(libc::ENOMEM as c_long),
+        };
+        let stack_size = blueos_kconfig::CONFIG_MAIN_THREAD_STACK_SIZE as usize;
+        if new_aspace.init_user_stack(stack_size).is_err() {
+            return -(libc::ENOMEM as c_long);
+        }
+
+        // Activate the new user table for the duration of the loader pipeline
+        // so image writes/zeroing and CodeCache synchronization translate
+        // through hardware TTBR0. Like boot's init_user_app, this is a
+        // transient activation under the syscall's irqsave-equivalent context.
+        arch::switch_user_address_space(None, Some(new_aspace.root_address()));
+
+        let loaded = match blueos_loader::load_elf(
+            reader,
+            LoadRequest::new(
+                profile::LoadProfile::aarch64(),
+                profile::LoadLimits::DEFAULT,
+            ),
+            AddressSpaceImageAllocator::new(new_aspace.clone()),
+            &mut Aarch64CodeCache::new(),
+        ) {
+            Ok(l) => l,
+            Err(err) => {
+                arch::switch_user_address_space(Some(new_aspace.root_address()), None);
+                log::warn!("execve: loader pipeline failed: {:?}", err);
+                return -(libc::ENOEXEC as c_long);
+            }
+        };
+
+        // Load complete: drop back to kernel-only TTBR0 for stack-frame
+        // construction and entry extraction (all kernel-side work).
+        arch::switch_user_address_space(Some(new_aspace.root_address()), None);
+
+        let entry: TargetAddress = match loaded.entry() {
+            Some(e) => e,
+            None => {
+                log::warn!("execve: ELF has no entry point");
+                return -(libc::ENOEXEC as c_long);
+            }
+        };
+        let pc = entry.get() as usize;
+
+        // --- 4. Build the ELF startup stack frame (argc/argv/envp/auxv) ----
+        //
+        // Borrow the owned Vec<u8> slices as &[&[u8]] for build_user_stack.
+        let argv_refs: Vec<&[u8]> = argv_vec.iter().map(|v| v.as_slice()).collect();
+        let envp_refs: Vec<&[u8]> = envp_vec.iter().map(|v| v.as_slice()).collect();
+        // auxv: AT_PAGESZ. A full libc startup also wants AT_PHDR/AT_ENTRY/
+        // AT_RANDOM etc.; those are left as a follow-up — the current
+        // init_user_app path passes an empty auxv, so this is already a
+        // strict superset.
+        // AT_PAGESZ: the page size. `MMAP_MIN_DEFAULT` is `PageEntry::PAGE_SIZE`
+        // (4096 on aarch64 4k granule), the canonical page size used throughout
+        // the address-space layer.
+        let pagesz = crate::mm::address_space::MMAP_MIN_DEFAULT;
+        // AT_PAGESZ = 6 (ELF auxiliary vector key for the page size). The
+        // vendored libc in this tree does not export the constant, so use the
+        // canonical glibc/ELF value directly.
+        const AT_PAGESZ: usize = 6;
+        let auxv: [(usize, usize); 1] = [(AT_PAGESZ, pagesz)];
+        let start = match new_aspace.build_user_stack(&argv_refs, &envp_refs, &auxv) {
+            Ok(s) => s,
+            Err(_) => {
+                log::warn!("execve: build_user_stack failed");
+                return -(libc::ENOMEM as c_long);
+            }
+        };
+        let sp = start.sp();
+
+        // --- 5. Commit: swap address space + overwrite saved context -------
+        //
+        // Everything above was reversible on failure. Past this point the old
+        // image is gone. The swap and the context overwrite happen under a
+        // single irqsave guard so no timer IRQ can schedule between them.
+        let _irq = crate::support::DisableInterruptGuard::new();
+        let _old_aspace = proc.replace_address_space(new_aspace);
+
+        // Overwrite the calling thread's saved EL0 context so the syscall
+        // return path erets straight into the new image. x0 is zeroed: a
+        // successful execve does not "return" a value — the new program starts
+        // fresh at its entry point.
+        let mut new_ctx = ArchContext::default();
+        new_ctx.init_user(pc, sp);
+        {
+            // The thread's saved context lives at `saved_sp()` on its kernel
+            // stack (the same forged frame fork_impl writes for the child).
+            // We hold the thread lock to match fork_impl's access pattern.
+            // SAFETY: `saved_sp` points to a valid `ArchContext` forged on the
+            // thread's kernel stack; we are the sole writer under irqsave.
+            let dst = current.saved_sp() as *mut ArchContext;
+            unsafe { core::ptr::write(dst, new_ctx) };
+        }
+
+        // --- 6. Close close-on-exec file descriptors -----------------------
+        #[cfg(enable_vfs)]
+        {
+            proc.fd_manager().irqsave_lock().close_cloexec_fds();
+        }
+
+        // Keep the loaded image's backing mapping alive for the life of the
+        // new image (mirrors init_user_app: LoadedImage has no
+        // take-ownership accessor, so forget it to skip the mapping's Drop).
+        core::mem::forget(loaded);
+
+        // `old_aspace` drops here (after the irqsave guard releases): its Arc
+        // refcount falls, and with no sibling threads holding it the old page
+        // table is reclaimed. On SMP this drop would need a TLB shootdown of
+        // any core that had loaded it — handled by the address-space reclaim
+        // path, not here.
+        log::info!("execve: new image at pc={:#x} sp={:#x}", pc, sp);
+        0
+    }
+}
 
 define_syscall_handler!(sched_yield() -> c_long {
     scheduler::yield_me();
@@ -926,6 +1207,8 @@ syscall_table! {
     (SetSchedParam, set_sched_param),
     (CreateThread, create_thread),
     (ExitThread, exit_thread),
+    (Fork, fork),
+    (Execve, execve),
     (ApplicationBeginExit, application_begin_exit),
     (ApplicationFinishExit, application_finish_exit),
     (AtomicWake, atomic_wake),

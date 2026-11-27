@@ -12,11 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! vfs_fd.rs  
+//! vfs_fd.rs
 
 use crate::{
     error::{code, Error},
-    vfs::{file::FileOps, path},
+    vfs::{
+        file::{FileOps, OpenFlags},
+        path,
+    },
 };
 use alloc::{sync::Arc, vec, vec::Vec};
 use core::ffi::c_int;
@@ -30,6 +33,7 @@ pub const STDERR_FILENO: c_int = 2;
 pub const FIRST_FD: usize = 3;
 
 /// File descriptor manager
+#[derive(Clone)]
 pub struct FdManager {
     /// File descriptor table
     fds: Vec<Option<Arc<dyn FileOps>>>,
@@ -134,6 +138,35 @@ impl FdManager {
     /// Get current number of allocated file descriptors
     pub fn count(&self) -> usize {
         self.fds.iter().filter(|fd| fd.is_some()).count()
+    }
+
+    /// Close every file descriptor marked `FD_CLOEXEC` (`O_CLOEXEC`).
+    pub fn close_cloexec_fds(&mut self) {
+        for slot in self.fds.iter_mut() {
+            if let Some(ops) = slot.as_ref() {
+                if ops
+                    .flags()
+                    .contains(OpenFlags::O_CLOEXEC)
+                    .then(|| ops.close())
+                    .is_some()
+                {
+                    *slot = None;
+                }
+            }
+        }
+        // `next_fd` may now point past freed slots; recompute to the lowest
+        // free slot so subsequent `alloc_fd` reuses them.
+        self.next_fd = self
+            .fds
+            .iter()
+            .enumerate()
+            .skip(FIRST_FD)
+            .find(|(_, s)| s.is_none())
+            .map(|(i, _)| i)
+            .unwrap_or(self.fds.len());
+        if self.next_fd >= self.fds.len() {
+            self.fds.resize(self.next_fd + 1, None);
+        }
     }
 
     fn update_next_fd(&mut self, new_fd: usize) {

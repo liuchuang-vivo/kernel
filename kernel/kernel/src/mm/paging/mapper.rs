@@ -203,9 +203,8 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
     /// stores the bare, page-aligned PFN itself. Frame 0 is never allocated, so
     /// a zero entry still reads as "no mapping".
     fn recover_pfn(entry: usize) -> Option<usize> {
-        P::table_address(entry).or_else(|| {
-            (entry != 0 && entry & (P::PAGE_SIZE - 1) == 0).then_some(entry)
-        })
+        P::table_address(entry)
+            .or_else(|| (entry != 0 && entry & (P::PAGE_SIZE - 1) == 0).then_some(entry))
     }
 
     /// Back an exclusively reserved VA range with individually owned frames.
@@ -258,11 +257,13 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
                     .ok_or("out of backing frames")?;
                 if init == FrameInit::Zeroed {
                     let ptr = kernel_phys_to_virt(frame).into_raw() as *mut u8;
-                    unsafe { ptr.write_bytes(0, P::PAGE_SIZE); }
+                    unsafe {
+                        ptr.write_bytes(0, P::PAGE_SIZE);
+                    }
                 }
-                if let Err(e) =
-                    unsafe { self.map_range(VirtualAddress::new(va), frame, P::PAGE_SIZE, attributes) }
-                {
+                if let Err(e) = unsafe {
+                    self.map_range(VirtualAddress::new(va), frame, P::PAGE_SIZE, attributes)
+                } {
                     unsafe {
                         self.allocator
                             .free_frame(frame)
@@ -274,7 +275,82 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
             Ok(())
         })();
         if result.is_err() {
-            unsafe { self.release_owned_range(virt, len, &mut synchronize); }
+            unsafe {
+                self.release_owned_range(virt, len, &mut synchronize);
+            }
+        } else {
+            synchronize();
+        }
+        result
+    }
+
+    /// Allocate fresh backing for `virt` and copy `len` bytes page-by-page from
+    /// `src_mapper`'s backing, mapping each new frame with `attributes`.
+    ///
+    /// # Safety
+    /// The caller exclusively owns the destination range in this mapper and
+    /// serializes the source mapper (it must not change concurrently). `src_mapper`
+    /// must remain live for the duration. The destination table must be inactive.
+    pub(crate) unsafe fn duplicate_owned_range(
+        &mut self,
+        src_mapper: &PageMapper<F, P>,
+        virt: VirtualAddress,
+        len: usize,
+        attributes: MemAttribute,
+        mut synchronize: impl FnMut(),
+    ) -> Result<(), &'static str> {
+        Self::validate_attributes(attributes)?;
+        let start = virt.into_raw();
+        let end = start.checked_add(len).ok_or("owned mapping overflow")?;
+        if len == 0 || (start | len) & (P::PAGE_SIZE - 1) != 0 {
+            return Err("invalid owned range");
+        }
+        if !Self::valid_va(start)
+            || !Self::valid_va(end - 1)
+            || (start >> P::VIRT_ADDR_BITS) != ((end - 1) >> P::VIRT_ADDR_BITS)
+        {
+            return Err("mapping range exceeds address space");
+        }
+        for va in (start..end).step_by(P::PAGE_SIZE) {
+            if self.leaf_entry(va).is_some() {
+                return Err("owned range already mapped");
+            }
+            if src_mapper.leaf_entry(va).is_none() {
+                return Err("source range is not fully populated");
+            }
+        }
+        let result = (|| {
+            unsafe { self.prepare_range(virt, len) }?;
+            for va in (start..end).step_by(P::PAGE_SIZE) {
+                let src_phys = src_mapper
+                    .translate(va)
+                    .ok_or("source page disappeared during clone")?;
+                let frame = self
+                    .allocator
+                    .alloc_frame()
+                    .ok_or("out of backing frames")?;
+                // Copy the source page into the new frame through the kernel
+                // direct map. Both aliases are writable kernel VAs.
+                let src = kernel_phys_to_virt(src_phys).into_raw() as *const u8;
+                let dst = kernel_phys_to_virt(frame).into_raw() as *mut u8;
+                unsafe { core::ptr::copy_nonoverlapping(src, dst, P::PAGE_SIZE) };
+                if let Err(e) = unsafe {
+                    self.map_range(VirtualAddress::new(va), frame, P::PAGE_SIZE, attributes)
+                } {
+                    unsafe {
+                        self.allocator
+                            .free_frame(frame)
+                            .expect("return unpublished frame");
+                    }
+                    return Err(e);
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            unsafe {
+                self.release_owned_range(virt, len, &mut synchronize);
+            }
         } else {
             synchronize();
         }
@@ -304,7 +380,9 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
             if let Some(slot) = self.existing_slot(va) {
                 let entry = unsafe { slot.read() };
                 if P::is_valid(entry) {
-                    unsafe { slot.write(entry & !1); }
+                    unsafe {
+                        slot.write(entry & !1);
+                    }
                 }
             }
         }
@@ -330,7 +408,9 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
         let span = P::PAGE_SIZE * (P::PAGE_SIZE / size_of::<usize>());
         let mut va = start;
         while va < end {
-            unsafe { self.prune_empty_path(va, &mut retired); }
+            unsafe {
+                self.prune_empty_path(va, &mut retired);
+            }
             va += (span - (va & (span - 1))).min(end - va);
         }
         if retired != 0 {
@@ -338,8 +418,7 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
             while retired != 0 {
                 let frame = retired;
                 retired = unsafe {
-                    (kernel_phys_to_virt(PhysicalAddress::new(frame)).into_raw()
-                        as *const usize)
+                    (kernel_phys_to_virt(PhysicalAddress::new(frame)).into_raw() as *const usize)
                         .read()
                 };
                 unsafe {
@@ -367,8 +446,8 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
             depth = level as usize + 1;
         }
         for level in (1..=depth).rev() {
-            let ptr = kernel_phys_to_virt(PhysicalAddress::new(tables[level])).into_raw()
-                as *mut usize;
+            let ptr =
+                kernel_phys_to_virt(PhysicalAddress::new(tables[level])).into_raw() as *mut usize;
             let nonempty = unsafe {
                 core::slice::from_raw_parts(ptr, P::PAGE_SIZE / size_of::<usize>())
                     .iter()
@@ -461,14 +540,15 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
         for va in (first..=last).step_by(P::PAGE_SIZE) {
             let slot = self.existing_slot(va).ok_or("no mapping to reprotect")?;
             let entry = unsafe { slot.read() };
-            let pfn = Self::recover_pfn(entry)
-                .ok_or("reprotect target is not a leaf mapping")?;
+            let pfn = Self::recover_pfn(entry).ok_or("reprotect target is not a leaf mapping")?;
             let new_desc = if has_access {
                 P::get_translate(pfn, attributes, false)
             } else {
                 pfn
             };
-            unsafe { slot.write(new_desc); }
+            unsafe {
+                slot.write(new_desc);
+            }
         }
         synchronize();
         Ok(())

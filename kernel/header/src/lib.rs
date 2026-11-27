@@ -29,6 +29,7 @@ pub mod syscalls {
         SetSchedParam,
         CreateThread,
         ExitThread,
+        Fork,
         AtomicWait,
         AtomicWake,
         AllocMem,
@@ -99,6 +100,7 @@ pub mod syscalls {
         ApplicationBeginExit,
         ApplicationFinishExit,
         ReallocMem,
+        Execve,
         LastNR,
     }
 }
