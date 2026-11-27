@@ -114,6 +114,15 @@ impl ProcessManager {
         Ok(inserted)
     }
 
+    /// Allocate a PID and register a forked child of `parent`.
+    pub fn fork_process(&self, parent: &Arc<Process>) -> Result<Arc<Process>, Error> {
+        let pid = self.alloc_pid();
+        let process = Process::fork(pid, parent)?;
+        let inserted = self.table.insert(process);
+        parent.add_child(inserted.pid(), Arc::downgrade(&inserted));
+        Ok(inserted)
+    }
+
     pub fn destroy_process(&self, pid: Pid) -> Option<Arc<Process>> {
         if pid == ROOT_PID {
             return None;
@@ -276,6 +285,28 @@ impl Process {
         {
             p.fd_manager.irqsave_lock().init_stdio()?;
         }
+        p.threads.irqsave_lock().init();
+        Ok(arc)
+    }
+
+    pub(crate) fn fork(pid: Pid, parent: &Arc<Process>) -> Result<Arc<Self>, crate::error::Error> {
+        let child_as = Arc::new(AddressSpace::new()?);
+        #[cfg(paging)]
+        AddressSpace::duplicate_from(&child_as, &parent.address_space)?;
+        let arc = Arc::new(Self {
+            pid,
+            topology: SpinLock::new(ProcessTopology {
+                parent: Arc::downgrade(parent),
+                children: BTreeMap::new(),
+                state: ProcessState::Alive,
+            }),
+            threads: SpinLock::new(ThreadList::new()),
+            address_space: child_as,
+            #[cfg(enable_vfs)]
+            fd_manager: SpinLock::new(parent.fd_manager.irqsave_lock().clone()),
+        });
+        // SAFETY: `arc` is the sole strong ref and is not yet observable.
+        let p = unsafe { Arc::as_ptr(&arc).cast_mut().as_mut().unwrap() };
         p.threads.irqsave_lock().init();
         Ok(arc)
     }

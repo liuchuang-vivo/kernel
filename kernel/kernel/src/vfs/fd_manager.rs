@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! vfs_fd.rs  
+//! vfs_fd.rs
 
 use crate::{
     error::{code, Error},
@@ -30,6 +30,7 @@ pub const STDERR_FILENO: c_int = 2;
 pub const FIRST_FD: usize = 3;
 
 /// File descriptor manager
+#[derive(Clone)]
 pub struct FdManager {
     /// File descriptor table
     fds: Vec<Option<Arc<dyn FileOps>>>,

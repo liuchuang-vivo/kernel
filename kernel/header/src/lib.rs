@@ -29,6 +29,7 @@ pub mod syscalls {
         SetSchedParam,
         CreateThread,
         ExitThread,
+        Fork,
         AtomicWait,
         AtomicWake,
         AllocMem,

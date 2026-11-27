@@ -24,17 +24,21 @@ mod stack_startup;
 pub use stack_startup::UserStackStart;
 
 #[cfg(paging)]
+use crate::mm::{CachePolicy, MemType};
+#[cfg(paging)]
 use crate::{
     arch::page::PageEntry,
     mm::{
         paging::{
             first_fit::FirstFitFrameAllocator, mapper::PageMapper, FrameAllocator, PageFormat,
         },
-        PhysicalAddress,
+        MemAttribute, PhysicalAddress, VirtualAddress,
     },
 };
 use crate::{error, mm::MemFlags, sync::SpinLock};
 use alloc::collections::BTreeMap;
+#[cfg(paging)]
+use alloc::vec::Vec;
 
 #[cfg(paging)]
 pub const MMAP_MIN_DEFAULT: usize = PageEntry::PAGE_SIZE;
@@ -247,7 +251,9 @@ impl AddressSpace {
         flags: MemFlags,
     ) -> Result<(), error::Error> {
         self.validate_range(start, start.checked_add(len).ok_or(error::code::EINVAL)?)?;
-        self.state.irqsave_lock().load_image_range(start, len, flags)
+        self.state
+            .irqsave_lock()
+            .load_image_range(start, len, flags)
     }
 
     /// Release a loaded image range: retire its mappings and drop its VMA.
@@ -520,6 +526,61 @@ impl AddressSpace {
             return true;
         }
         false
+    }
+
+    #[cfg(paging)]
+    pub fn duplicate_from(&self, parent: &AddressSpace) -> Result<(), error::Error> {
+        let parent_state = parent.state.irqsave_lock();
+        let parent_mapper = &parent_state.mapper;
+        let parent_stack = parent_state.user_stack;
+
+        for (&start, vma) in parent_state.vmas.iter() {
+            let end = vma.end();
+            let len = end - start;
+            // fork copies whole pages; byte-granular tails should not exist in a
+            // populated image, but guard against misaligned VMA metadata.
+            if (start | len) & (PageEntry::PAGE_SIZE - 1) != 0 {
+                return Err(error::code::EINVAL);
+            }
+            if len == 0 {
+                continue;
+            }
+            {
+                let mut state = self.state.irqsave_lock();
+                if Self::overlaps(&state.vmas, start, end) {
+                    return Err(error::code::EEXIST);
+                }
+                state.vmas.insert(start, *vma);
+                if vma.flags().is_empty() {
+                    continue;
+                }
+                let attributes = MemAttribute {
+                    flags: vma.flags(),
+                    memory_type: MemType::Normal(CachePolicy::WriteBack),
+                };
+                // SAFETY: this space is inactive and exclusively owned by the
+                // caller; the destination range was just reserved and is empty.
+                let mapped = unsafe {
+                    state.mapper.duplicate_owned_range(
+                        parent_mapper,
+                        VirtualAddress::new(start),
+                        len,
+                        attributes,
+                        || {},
+                    )
+                };
+                if mapped.is_err() {
+                    state.vmas.remove(&start);
+                    return Err(error::code::ENOMEM);
+                }
+            }
+        }
+
+        // Inherit the user-stack layout so the child resumes on a copied stack.
+        if let Some(stack) = parent_stack {
+            self.state.irqsave_lock().user_stack = Some(stack);
+        }
+        Ok(())
     }
 }
 

@@ -580,6 +580,10 @@ define_syscall_handler!(exit_thread() -> c_long {
     -1
 });
 
+define_syscall_handler!(fork() -> c_long {
+    fork_impl()
+});
+
 // These operations coordinate this kernel's standalone application runtime;
 // they are not Linux exit/exit_group syscall numbers or forced cancellation.
 define_syscall_handler!(application_begin_exit(status: c_int) -> c_long {
@@ -612,6 +616,69 @@ define_syscall_handler!(application_finish_exit() -> c_long {
     #[cfg(not(loader_backend))]
     { -(libc::ENOSYS as c_long) }
 });
+
+/// `fork` implementation: duplicate the current process.
+fn fork_impl() -> core::ffi::c_long {
+    use core::ffi::c_long;
+
+    #[cfg(not(paging))]
+    {
+        return -(libc::ENOSYS as c_long);
+    }
+    #[cfg(not(enable_vfs))]
+    {
+        return -(libc::ENOSYS as c_long);
+    }
+    #[cfg(all(paging, enable_vfs))]
+    {
+        use crate::{arch::Context as ArchContext, process::ProcessManager};
+
+        let Some(parent) = crate::process::current_process() else {
+            return -(libc::EPERM as c_long);
+        };
+        let current = scheduler::current_thread_ref();
+        if current.kind() != thread::ThreadKind::User {
+            return -(libc::EPERM as c_long);
+        }
+
+        let parent_ctx: &ArchContext = unsafe { &*(current.saved_sp() as *const ArchContext) };
+
+        // Create the child process
+        let child = match ProcessManager::get().fork_process(&parent) {
+            Ok(c) => c,
+            Err(_) => return -(libc::ENOMEM as c_long),
+        };
+        let child_pid = child.pid().0 as c_long;
+
+        let mut child_ctx: ArchContext = unsafe { core::ptr::read(parent_ctx) };
+        child_ctx.x0 = 0;
+
+        let child_thread = Builder::new(Entry::User {
+            pc: parent_ctx.elr,
+            sp: parent_ctx.sp_el0,
+        })
+        .build();
+
+        {
+            let mut w = child_thread.lock();
+            let dst = w.saved_sp() as *mut ArchContext;
+            unsafe { core::ptr::write(dst, child_ctx) };
+        }
+
+        if !child.add_thread(child_thread.clone()) {
+            let mut t = child_thread.clone();
+            thread::GlobalQueueVisitor::remove(&mut t);
+            return -(libc::EAGAIN as c_long);
+        }
+
+        debug_assert_eq!(
+            scheduler::queue_ready_thread(thread::IDLE, child_thread),
+            Ok(())
+        );
+
+        child_pid
+    }
+}
 
 define_syscall_handler!(sched_yield() -> c_long {
     scheduler::yield_me();
@@ -926,6 +993,7 @@ syscall_table! {
     (SetSchedParam, set_sched_param),
     (CreateThread, create_thread),
     (ExitThread, exit_thread),
+    (Fork, fork),
     (ApplicationBeginExit, application_begin_exit),
     (ApplicationFinishExit, application_finish_exit),
     (AtomicWake, atomic_wake),
